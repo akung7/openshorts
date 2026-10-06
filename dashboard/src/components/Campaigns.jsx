@@ -303,15 +303,15 @@ export default function Campaigns({ onOpenDraft }) {
           <form onSubmit={createCampaign} className="card p-4 sm:p-6 space-y-4">
             <SectionHead icon={FolderOpen} eyebrow="NEW CAMPAIGN" title="Campaign details" />
             <div className="grid sm:grid-cols-2 gap-4">
-              <label className="block sm:col-span-2"><span className="text-sm font-medium text-ink">Campaign name</span><input required value={newForm.name} onChange={(e) => setNewForm({ ...newForm, name: e.target.value })} maxLength={120} className="input mt-2 w-full" placeholder="Clippo — October fitness brief" /></label>
-              <label className="block"><span className="text-sm font-medium text-ink">Platform</span><input value={newForm.platform} onChange={(e) => setNewForm({ ...newForm, platform: e.target.value })} maxLength={200} className="input mt-2 w-full" placeholder="contentrewards / clippo.id" /></label>
-              <label className="block"><span className="text-sm font-medium text-ink">Reward</span><input value={newForm.reward} onChange={(e) => setNewForm({ ...newForm, reward: e.target.value })} maxLength={200} className="input mt-2 w-full" placeholder="$100 per accepted clip" /></label>
-              <label className="block"><span className="text-sm font-medium text-ink">Deadline</span><input value={newForm.deadline} onChange={(e) => setNewForm({ ...newForm, deadline: e.target.value })} maxLength={200} className="input mt-2 w-full" placeholder="2026-10-31" /></label>
-              <label className="block"><span className="text-sm font-medium text-ink">Brief link</span><input value={newForm.brief_link} onChange={(e) => setNewForm({ ...newForm, brief_link: e.target.value })} maxLength={500} className="input mt-2 w-full" placeholder="https://…" /></label>
+              <label className="block sm:col-span-2"><span className="text-sm font-medium text-ink">Campaign name</span><input required value={newForm.name} onChange={(e) => setNewForm({ ...newForm, name: e.target.value })} maxLength={120} className="input-field mt-2 w-full" placeholder="Clippo — October fitness brief" /></label>
+              <label className="block"><span className="text-sm font-medium text-ink">Platform</span><input value={newForm.platform} onChange={(e) => setNewForm({ ...newForm, platform: e.target.value })} maxLength={200} className="input-field mt-2 w-full" placeholder="contentrewards / clippo.id" /></label>
+              <label className="block"><span className="text-sm font-medium text-ink">Reward</span><input value={newForm.reward} onChange={(e) => setNewForm({ ...newForm, reward: e.target.value })} maxLength={200} className="input-field mt-2 w-full" placeholder="$100 per accepted clip" /></label>
+              <label className="block"><span className="text-sm font-medium text-ink">Deadline</span><input value={newForm.deadline} onChange={(e) => setNewForm({ ...newForm, deadline: e.target.value })} maxLength={200} className="input-field mt-2 w-full" placeholder="2026-10-31" /></label>
+              <label className="block"><span className="text-sm font-medium text-ink">Brief link</span><input value={newForm.brief_link} onChange={(e) => setNewForm({ ...newForm, brief_link: e.target.value })} maxLength={500} className="input-field mt-2 w-full" placeholder="https://…" /></label>
             </div>
             <div>
               <span className="text-sm font-medium text-ink">Guideline (optional now)</span>
-              <textarea value={newForm.guideline_text} onChange={(e) => setNewForm({ ...newForm, guideline_text: e.target.value })} maxLength={50000} rows={4} className="input mt-2 w-full resize-y" placeholder="Paste the rules, or add them after creating the campaign." />
+              <textarea value={newForm.guideline_text} onChange={(e) => setNewForm({ ...newForm, guideline_text: e.target.value })} maxLength={50000} rows={4} className="input-field mt-2 w-full resize-y" placeholder="Paste the rules, or add them after creating the campaign." />
             </div>
             <div className="flex gap-2 justify-end">
               <button type="button" onClick={() => setCreating(false)} className="btn-quiet px-3 py-2 text-sm">Cancel</button>
@@ -379,7 +379,7 @@ export default function Campaigns({ onOpenDraft }) {
               />
               {guideMode === 'text' && (
                 <>
-                  <textarea value={guidelineDraft} onChange={(e) => setGuidelineDraft(e.target.value)} maxLength={50000} rows={6} placeholder="Paste the campaign guideline here…" className="input w-full resize-y font-mono text-xs" />
+                  <textarea value={guidelineDraft} onChange={(e) => setGuidelineDraft(e.target.value)} maxLength={50000} rows={6} placeholder="Paste the campaign guideline here…" className="input-field w-full resize-y" />
                   <div className="flex flex-wrap gap-2 mt-3">
                     <button type="button" onClick={saveMeta} disabled={busy === 'save'} className="btn-quiet px-3 py-2 text-xs disabled:opacity-50"><Save size={13} />Save guideline</button>
                     <button type="button" onClick={parseGuideline} disabled={busy === 'parse' || !guidelineDraft.trim()} className="btn-primary px-3 py-2 text-xs disabled:opacity-50">{busy === 'parse' ? <Loader2 size={13} className="animate-spin" /> : <Wand2 size={13} />}Extract rules with AI</button>
@@ -388,7 +388,7 @@ export default function Campaigns({ onOpenDraft }) {
               )}
               {guideMode === 'url' && (
                 <>
-                  <input type="url" value={guideUrl} onChange={(e) => setGuideUrl(e.target.value)} maxLength={500} placeholder="https://public-site.example/guideline.pdf" className="input w-full" />
+                  <input type="url" value={guideUrl} onChange={(e) => setGuideUrl(e.target.value)} maxLength={500} placeholder="https://public-site.example/guideline.pdf" className="input-field w-full" />
                   <p className="text-xs text-muted mt-2">Readable public pages, PDF, plain text and Markdown are fetched by the server — a link that needs sign-in (e.g. a Drive viewer page) will not extract.</p>
                   <div className="flex flex-wrap gap-2 mt-3">
                     <button type="button" onClick={saveGuidelineUrl} disabled={busy === 'save-url' || !guideUrl.trim()} className="btn-quiet px-3 py-2 text-xs disabled:opacity-50"><Save size={13} />Save link</button>
@@ -422,16 +422,16 @@ export default function Campaigns({ onOpenDraft }) {
                 <input type="file" onChange={(e) => setAssetFile(e.target.files?.[0] || null)} className="block w-full text-sm text-muted file:mr-3 file:rounded-input file:border-0 file:bg-paper3 file:px-3 file:py-2 file:text-ink" />
               )}
               {assetMode === 'url' && (
-                <input type="url" value={assetUrl} onChange={(e) => setAssetUrl(e.target.value)} maxLength={2000} placeholder="https://example.com/footage-clip.mp4" className="input w-full" />
+                <input type="url" value={assetUrl} onChange={(e) => setAssetUrl(e.target.value)} maxLength={2000} placeholder="https://example.com/footage-clip.mp4" className="input-field w-full" />
               )}
               <div className="grid sm:grid-cols-[10rem_minmax(0,1fr)] gap-3 mt-3">
                 <label className="block"><span className="text-xs text-muted">Kind</span>
-                  <select value={assetKind} onChange={(e) => setAssetKind(e.target.value)} className="input mt-1 w-full">
+                  <select value={assetKind} onChange={(e) => setAssetKind(e.target.value)} className="input-field mt-1 w-full">
                     {ASSET_KINDS.map((kind) => <option key={kind} value={kind}>{kind}</option>)}
                   </select>
                 </label>
                 <label className="block"><span className="text-xs text-muted">Usage note (optional)</span>
-                  <input value={assetNote} onChange={(e) => setAssetNote(e.target.value)} maxLength={1000} className="input mt-1 w-full" placeholder="e.g. main b-roll, cleared for this campaign" />
+                  <input value={assetNote} onChange={(e) => setAssetNote(e.target.value)} maxLength={1000} className="input-field mt-1 w-full" placeholder="e.g. main b-roll, cleared for this campaign" />
                 </label>
               </div>
               <div className="flex flex-wrap gap-2 mt-3">

@@ -373,7 +373,7 @@ export default function CustomClips() {
               </label>
               <label className="flex flex-col gap-2 p-3 rounded-card border border-rule bg-paper2 text-sm text-ink2">
                 <span>Or paste a supported video URL</span>
-                <input type="url" value={sourceUrl} onChange={(e) => setSourceUrl(e.target.value)} placeholder="https://…" className="input w-full" />
+                <input type="url" value={sourceUrl} onChange={(e) => setSourceUrl(e.target.value)} placeholder="https://…" className="input-field w-full" />
               </label>
             </div>
             <p className="text-xs text-muted mt-2">Choose one source only. Upload your own video or one you have permission to use.</p>
@@ -382,16 +382,16 @@ export default function CustomClips() {
           <section>
             <div className="flex items-center gap-2 mb-2"><FileText size={15} className="text-brass" /><label className="text-sm font-medium text-ink">Campaign guideline</label></div>
             <div className="flex flex-wrap gap-2 mb-3">{guideTab('text', 'Paste text')}{guideTab('file', 'Upload PDF / TXT / MD')}{guideTab('url', 'Public link')}</div>
-            {guideMode === 'text' && <textarea value={guideText} onChange={(e) => setGuideText(e.target.value)} rows={5} maxLength={50000} placeholder="Paste campaign rules, content preferences, prohibited claims, and platform requirements…" className="input w-full resize-y" />}
+            {guideMode === 'text' && <textarea value={guideText} onChange={(e) => setGuideText(e.target.value)} rows={5} maxLength={50000} placeholder="Paste campaign rules, content preferences, prohibited claims, and platform requirements…" className="input-field w-full resize-y" />}
             {guideMode === 'file' && <input type="file" accept=".pdf,.txt,.md,.markdown,application/pdf,text/plain,text/markdown" onChange={(e) => setGuideFile(e.target.files?.[0] || null)} className="block w-full text-sm text-muted file:mr-3 file:rounded-input file:border-0 file:bg-paper3 file:px-3 file:py-2 file:text-ink" />}
-            {guideMode === 'url' && <input type="url" value={guideUrl} onChange={(e) => setGuideUrl(e.target.value)} placeholder="https://public-site.example/guideline.pdf" className="input w-full" />}
+            {guideMode === 'url' && <input type="url" value={guideUrl} onChange={(e) => setGuideUrl(e.target.value)} placeholder="https://public-site.example/guideline.pdf" className="input-field w-full" />}
             <p className="text-xs text-muted mt-2">Guidelines are used for this draft only. PDF, plain text, Markdown, or readable public pages are supported.</p>
           </section>
 
           {campaigns.length > 0 && (
             <section>
               <label htmlFor="analyze-campaign" className="block text-sm font-medium text-ink mb-2">Campaign (optional)</label>
-              <select id="analyze-campaign" value={campaignId} onChange={(e) => setCampaignId(e.target.value)} className="input w-full sm:max-w-md">
+              <select id="analyze-campaign" value={campaignId} onChange={(e) => setCampaignId(e.target.value)} className="input-field w-full sm:max-w-md">
                 <option value="">No campaign — one-off analysis</option>
                 {campaigns.map((campaign) => (
                   <option key={campaign.id} value={campaign.id}>{campaign.name}{campaign.platform ? ` · ${campaign.platform}` : ''}</option>
@@ -403,7 +403,7 @@ export default function CustomClips() {
 
           <section>
             <label htmlFor="campaign-ai-provider" className="block text-sm font-medium text-ink mb-2">AI model for this campaign</label>
-            <select id="campaign-ai-provider" value={aiProvider} onChange={(e) => setAiProvider(e.target.value)} className="input w-full sm:max-w-md">
+            <select id="campaign-ai-provider" value={aiProvider} onChange={(e) => setAiProvider(e.target.value)} className="input-field w-full sm:max-w-md">
               {campaignAiModels.map((item) => (
                 <option key={item.id} value={item.id}>{item.provider} · {item.model}</option>
               ))}
@@ -473,12 +473,12 @@ export default function CustomClips() {
                       {editable && <button type="button" onClick={() => removeCandidate(key)} aria-label={`Remove candidate ${index + 1}`} disabled={savingEdits || isBusy} className="text-muted hover:text-red-300 disabled:opacity-50"><Trash2 size={15} /></button>}
                     </div>
                     <div className="grid grid-cols-2 gap-2">
-                      <label className="text-xs text-muted">Start (seconds)<input aria-label={`Candidate ${index + 1} start time in seconds`} type="number" min="0" max={draft.video_duration} step="0.1" value={clip.start} disabled={!editable || isBusy || savingEdits} onChange={(e) => Number.isFinite(e.target.valueAsNumber) && updateCandidate(key, { start: e.target.valueAsNumber, duration: Math.max(0, Number(clip.end) - e.target.valueAsNumber) })} className="input mt-1 w-full" /></label>
-                      <label className="text-xs text-muted">End (seconds)<input aria-label={`Candidate ${index + 1} end time in seconds`} type="number" min="0" max={draft.video_duration} step="0.1" value={clip.end} disabled={!editable || isBusy || savingEdits} onChange={(e) => Number.isFinite(e.target.valueAsNumber) && updateCandidate(key, { end: e.target.valueAsNumber, duration: Math.max(0, e.target.valueAsNumber - Number(clip.start)) })} className="input mt-1 w-full" /></label>
+                      <label className="text-xs text-muted">Start (seconds)<input aria-label={`Candidate ${index + 1} start time in seconds`} type="number" min="0" max={draft.video_duration} step="0.1" value={clip.start} disabled={!editable || isBusy || savingEdits} onChange={(e) => Number.isFinite(e.target.valueAsNumber) && updateCandidate(key, { start: e.target.valueAsNumber, duration: Math.max(0, Number(clip.end) - e.target.valueAsNumber) })} className="input-field mt-1 w-full" /></label>
+                      <label className="text-xs text-muted">End (seconds)<input aria-label={`Candidate ${index + 1} end time in seconds`} type="number" min="0" max={draft.video_duration} step="0.1" value={clip.end} disabled={!editable || isBusy || savingEdits} onChange={(e) => Number.isFinite(e.target.valueAsNumber) && updateCandidate(key, { end: e.target.valueAsNumber, duration: Math.max(0, e.target.valueAsNumber - Number(clip.start)) })} className="input-field mt-1 w-full" /></label>
                     </div>
-                    <label className="block text-xs text-muted">Title<input aria-label={`Candidate ${index + 1} title`} value={clip.title} disabled={!editable || isBusy || savingEdits} onChange={(e) => updateCandidate(key, { title: e.target.value })} maxLength={160} className="input mt-1 w-full" /></label>
-                    <label className="block text-xs text-muted">Hook<input aria-label={`Candidate ${index + 1} hook`} value={clip.hook} disabled={!editable || isBusy || savingEdits} onChange={(e) => updateCandidate(key, { hook: e.target.value })} maxLength={300} className="input mt-1 w-full" /></label>
-                    <label className="block text-xs text-muted">Caption<textarea aria-label={`Candidate ${index + 1} caption`} value={clip.caption} disabled={!editable || isBusy || savingEdits} onChange={(e) => updateCandidate(key, { caption: e.target.value })} maxLength={2000} rows={3} className="input mt-1 w-full resize-y" /></label>
+                    <label className="block text-xs text-muted">Title<input aria-label={`Candidate ${index + 1} title`} value={clip.title} disabled={!editable || isBusy || savingEdits} onChange={(e) => updateCandidate(key, { title: e.target.value })} maxLength={160} className="input-field mt-1 w-full" /></label>
+                    <label className="block text-xs text-muted">Hook<input aria-label={`Candidate ${index + 1} hook`} value={clip.hook} disabled={!editable || isBusy || savingEdits} onChange={(e) => updateCandidate(key, { hook: e.target.value })} maxLength={300} className="input-field mt-1 w-full" /></label>
+                    <label className="block text-xs text-muted">Caption<textarea aria-label={`Candidate ${index + 1} caption`} value={clip.caption} disabled={!editable || isBusy || savingEdits} onChange={(e) => updateCandidate(key, { caption: e.target.value })} maxLength={2000} rows={3} className="input-field mt-1 w-full resize-y" /></label>
                     <div className="flex flex-wrap gap-2">
                       <button type="button" onClick={() => previewCandidate(clip)} disabled={!sourcePreviewUrl || isBusy || Number(clip.end) <= Number(clip.start)} className="btn-quiet px-2.5 py-1.5 text-xs disabled:opacity-50"><Play size={13} />Preview range</button>
                       {editable && <>
@@ -498,7 +498,7 @@ export default function CustomClips() {
             <div className="flex items-center gap-2 mb-3"><MessageCircle size={16} className="text-brass" /><h3 className="text-sm font-medium text-ink">Discuss or revise with AI</h3></div>
             {draft.chat_history?.slice(-6).map((item, index) => <p key={`${item.role}-${index}`} className="text-xs text-muted mb-2"><strong className="text-ink2">{item.role === 'user' ? 'You' : 'AI'}:</strong> {item.content}</p>)}
             <form onSubmit={sendMessage} className="flex flex-col sm:flex-row gap-2">
-              <input value={chatMessage} onChange={(e) => setChatMessage(e.target.value)} maxLength={4000} placeholder="Ask to adjust a hook, explain a rule, or revise a candidate…" className="input flex-1" />
+              <input value={chatMessage} onChange={(e) => setChatMessage(e.target.value)} maxLength={4000} placeholder="Ask to adjust a hook, explain a rule, or revise a candidate…" className="input-field flex-1" />
               <button type="submit" disabled={busyChat || !chatMessage.trim() || hasUnsavedEdits || savingEdits} className="btn-quiet px-4 py-2 text-sm disabled:opacity-50">{busyChat ? <Loader2 size={15} className="animate-spin" /> : null}Discuss</button>
             </form>
           </div>}
