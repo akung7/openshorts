@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { Upload, Sparkles, Youtube, Instagram, Share2, ChevronDown, Check, Activity, LayoutDashboard, Settings, Plus, History, X, Terminal, Shield, LayoutGrid, Image, Globe, RotateCcw, Calendar, AlertTriangle, KeyRound, Bot, Users, Smartphone, ExternalLink, Copy, CheckCircle2, Mail, Loader2, Download, Menu, Lock, Rocket } from 'lucide-react';
+import { Upload, FolderOpen, Sparkles, Youtube, Instagram, Share2, ChevronDown, Check, Activity, LayoutDashboard, Settings, Plus, History, X, Terminal, Shield, LayoutGrid, Image, Globe, RotateCcw, Calendar, AlertTriangle, KeyRound, Bot, Users, Smartphone, ExternalLink, Copy, CheckCircle2, Mail, Loader2, Download, Menu, Lock, Rocket } from 'lucide-react';
 import KeyInput from './components/KeyInput';
 import MediaInput from './components/MediaInput';
 import McpConnectCard from './components/McpConnectCard';
@@ -28,6 +28,8 @@ import HistoryTab from './components/HistoryTab';
 import AutopilotTab from './components/AutopilotTab';
 import ProfileMenu from './components/ProfileMenu';
 import Modal from './components/ui/Modal';
+import Campaigns from './components/Campaigns';
+import CustomClips from './components/CustomClips';
 import { useAuth } from './contexts/AuthContext';
 import { apiFetch, apiJson, QuotaError } from './lib/api';
 import { track } from './lib/analytics';
@@ -1200,7 +1202,9 @@ function App() {
     { id: 'ugc-gallery', ord: '05', icon: LayoutGrid, label: 'UGC Gallery', short: 'gallery', primary: true },
     { id: 'thumbnails', ord: '06', icon: Image, label: 'YouTube Studio', short: 'studio', primary: true },
     ...(billingEnabled && isSignedIn ? [{ id: 'history', ord: '07', icon: History, label: 'History', short: 'history' }] : []),
-    { id: 'settings', ord: '08', icon: Settings, label: 'Settings', short: 'settings' },
+    { id: 'campaigns', ord: '08', icon: FolderOpen, label: 'Campaigns', short: 'campaigns' },
+    { id: 'custom-clips', ord: '09', icon: Sparkles, label: 'Custom Clips', short: 'custom clips' },
+    { id: 'settings', ord: '10', icon: Settings, label: 'Settings', short: 'settings' },
   ];
   const activeNav = navItems.find((n) => n.id === activeTab);
 
@@ -1551,6 +1555,10 @@ function App() {
 
         {/* Main Workspace */}
         <div className="flex-1 overflow-hidden relative">
+
+          {/* View: Custom Clips — separate analyze/review/approve/render workflow */}
+          {activeTab === 'campaigns' && <Campaigns onOpenDraft={() => goToTab('custom-clips')} />}
+          {activeTab === 'custom-clips' && <CustomClips />}
 
           {/* View: Settings */}
           {activeTab === 'settings' && (

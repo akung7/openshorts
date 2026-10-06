@@ -13,9 +13,11 @@ import hmac
 import time
 import zipfile
 import math
+import mimetypes
 import itertools
 import functools
 import asyncio
+import copy
 import signal
 import socket
 from datetime import datetime, timezone, timedelta
@@ -27,12 +29,27 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from starlette.background import BackgroundTask
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from s3_uploader import upload_job_artifacts, list_all_clips, upload_actor_to_s3, list_actor_gallery, upload_video_to_gallery, list_video_gallery
 import recut
 import layout_ranges
 import watermarked
 import media_auth
+import campaigns
+from custom_campaign import (
+    DraftValidationError,
+    StaleDraftError,
+    approve_draft,
+    assert_approved_draft,
+    build_approved_render_plan,
+    edit_draft_clips,
+    extract_guideline_text,
+    fetch_guideline_text,
+    generate_campaign_chat,
+    normalize_campaign_response,
+    parse_campaign_guideline,
+    revise_draft,
+)
 
 load_dotenv()
 
@@ -561,6 +578,7 @@ async def _assert_job_owner(request, record):
 job_queue = asyncio.PriorityQueue()
 _job_seq = itertools.count()
 jobs: Dict[str, Dict] = {}
+custom_draft_locks: Dict[str, asyncio.Lock] = {}
 thumbnail_sessions: Dict[str, Dict] = {}
 publish_jobs: Dict[str, Dict] = {}  # {publish_id: {status, result, error}}
 # Semester to limit concurrency to MAX_CONCURRENT_JOBS
@@ -1354,7 +1372,8 @@ def _install_drain_signal_handler():
 
 def _write_resume_manifest(job_id, cmd, priority, user_id, reservation_id, watermark,
                            webhook_url=None, webhook_secret=None, base_url=None,
-                           partial=None, source_cap_minutes=None, skip_statics=False):
+                           partial=None, source_cap_minutes=None, skip_statics=False,
+                           job_type=None):
     try:
         path = os.path.join(OUTPUT_DIR, job_id, _RESUME_FILE)
         with open(path, "w") as f:
@@ -1378,6 +1397,7 @@ def _write_resume_manifest(job_id, cmd, priority, user_id, reservation_id, water
                 "source_cap_minutes": source_cap_minutes,
                 # The probe's "statics bot-checked for this video" verdict.
                 "skip_statics": bool(skip_statics),
+                "job_type": job_type,
             }, f)
     except Exception as e:
         print(f"⚠️ Could not write resume manifest for {job_id}: {e}")
@@ -1502,6 +1522,7 @@ def _resume_interrupted_jobs() -> set:
             'webhook_url': m.get("webhook_url"),
             'webhook_secret': m.get("webhook_secret"),
             'base_url': m.get("base_url"),
+            'job_type': m.get("job_type"),
         }
         _enqueue_job(job_id, int(m.get("priority", 2)))
         resumed += 1
@@ -1862,21 +1883,20 @@ async def run_job_wrapper(job_id):
         # Settle the minute reservation (managed jobs only): commit on success,
         # release otherwise so the minutes go back to the user.
         await _settle_reservation(job_id, job)
-        # Archive the completed clips to the user's durable R2 library (history).
-        await _archive_managed_job(job_id)
-        # Autopilot bookkeeping + autopublish (before the generic clips-ready
-        # email, which it replaces for its own jobs).
-        await _autopilot_job_finished(job_id, job)
+        # Custom analysis has no rendered clips to archive or deliver; keep its
+        # private draft local until the user approves a separate render job.
+        if not job or job.get('job_type') != 'custom_analysis':
+            await _archive_managed_job(job_id)
+            # Autopilot bookkeeping + autopublish (before generic clip-ready email).
+            await _autopilot_job_finished(job_id, job)
+            await _notify_clips_ready(job_id)
+            await _notify_clip_activity(job_id)
         # Fire the caller's webhook (after archive, so durable links exist).
         await _notify_job_webhook(job_id)
         # Operational alerting for managed jobs (proxy out of credits / failures).
         await _record_job_alert(job_id)
         # Accumulate proxy bandwidth for the monthly cost alert.
         await _track_proxy_usage(job_id)
-        # Tell the owner their clips are ready (managed jobs, once per job).
-        await _notify_clips_ready(job_id)
-        # Telegram pulse for high-signal activity (first clip / paid user).
-        await _notify_clip_activity(job_id)
         # Always release semaphore and mark queue task done
         _running_jobs.discard(job_id)
         concurrency_semaphore.release()
@@ -2468,6 +2488,162 @@ def _safe_under(base_dir: str, user_rel_path: str) -> Optional[str]:
 class ProcessRequest(BaseModel):
     url: str
 
+
+class CustomChatRequest(BaseModel):
+    message: str
+    revision: int
+
+
+class CustomClipEditRequest(BaseModel):
+    id: Optional[str] = None
+    start: float
+    end: float
+    title: str = Field(default="", max_length=160)
+    hook: str = Field(default="", max_length=300)
+    caption: str = Field(default="", max_length=2000)
+    pillar: str = Field(default="Manual", max_length=80)
+
+
+class CustomDraftClipsRequest(BaseModel):
+    revision: int
+    clips: List[CustomClipEditRequest] = Field(max_length=50)
+
+
+@app.put("/api/custom/drafts/{draft_id}/clips")
+async def edit_custom_draft_clips(draft_id: str, body: CustomDraftClipsRequest, request: Request):
+    """Save the user's edited timeline and copy for this exact draft revision."""
+    canonical_id = str(uuid.UUID(_custom_draft_dir(draft_id).split(os.sep)[-1]))
+    lock = custom_draft_locks.setdefault(canonical_id, asyncio.Lock())
+    async with lock:
+        directory = await _assert_custom_draft_owner(request, canonical_id)
+        directory, draft = _read_custom_draft(canonical_id)
+        try:
+            updated = edit_draft_clips(
+                draft,
+                revision=body.revision,
+                clips=[clip.dict() for clip in body.clips],
+            )
+        except StaleDraftError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        except DraftValidationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        _save_custom_draft(directory, updated)
+        return updated
+
+
+class CustomApprovalRequest(BaseModel):
+    revision: int
+    selected_clip_ids: List[str]
+
+@app.post("/api/custom/drafts/{draft_id}/approve")
+async def approve_custom_draft(draft_id: str, body: CustomApprovalRequest, request: Request):
+    """Approve the exact proposal revision and enqueue only those time ranges."""
+    canonical_id = str(uuid.UUID(_custom_draft_dir(draft_id).split(os.sep)[-1]))
+    lock = custom_draft_locks.setdefault(canonical_id, asyncio.Lock())
+    async with lock:
+        directory = await _assert_custom_draft_owner(request, canonical_id)
+        directory, draft = _read_custom_draft(canonical_id)
+        if draft.get("render_job_id"):
+            raise HTTPException(status_code=409, detail="This draft has already been submitted for rendering.")
+        key = await resolve_gemini(request)
+        try:
+            approved = approve_draft(
+                draft, revision=body.revision, selected_clip_ids=body.selected_clip_ids
+            )
+            render_plan = build_approved_render_plan(approved)
+        except DraftValidationError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+
+        source = _custom_source_path(canonical_id, directory, draft)
+        if not source or not os.path.isfile(source):
+            raise HTTPException(status_code=410, detail="Source video expired; analyze it again before rendering.")
+
+        render_id = str(uuid.uuid4())
+        render_dir = os.path.join(OUTPUT_DIR, render_id)
+        staged_source = os.path.join(UPLOAD_DIR, f"{render_id}_{os.path.basename(source)}")
+        os.makedirs(render_dir, exist_ok=False)
+        reservation_id = None
+        try:
+            shutil.copyfile(source, staged_source)
+            _render_key = key
+            user_id, priority, reservation_id, user_plan, partial = await reserve_process_minutes(
+                request, None, staged_source, render_id
+            )
+            if partial:
+                allowed_seconds = float(partial["processed_minutes"]) * 60
+                if any(float(clip["end"]) > allowed_seconds for clip in render_plan["clips"]):
+                    raise HTTPException(
+                        status_code=402,
+                        detail="The approved clip ranges exceed the minutes available; select only clips within the offered partial duration or add minutes.",
+                    )
+            plan_path = os.path.join(render_dir, "approved_plan.json")
+            with open(plan_path, "w", encoding="utf-8") as handle:
+                json.dump(render_plan, handle, ensure_ascii=False)
+            cmd = [
+                sys.executable, "-u", "main.py",
+                "-i", staged_source,
+                "-o", render_dir,
+                "--format", "vertical",
+                "--custom-render-plan", plan_path,
+            ]
+            env = child_env()
+            env.setdefault("PYTHONIOENCODING", "utf-8")
+            if partial:
+                env["MAX_SOURCE_MINUTES"] = str(partial["processed_minutes"])
+            else:
+                env.pop("MAX_SOURCE_MINUTES", None)
+            if _render_key:
+                env["GEMINI_API_KEY"] = _render_key
+            if user_plan == "free":
+                env["WATERMARK"] = "1"
+            jobs[render_id] = {
+                "status": "queued",
+                "logs": _TimedLog([f"Approved custom render {render_id} queued."]),
+                "cmd": cmd,
+                "env": env,
+                "output_dir": render_dir,
+                "user_id": user_id,
+                "reservation_id": reservation_id,
+                "watermark": user_plan == "free",
+                "partial": partial,
+                "job_type": "custom_render",
+                "user_plan": user_plan,
+            }
+            if user_id is not None:
+                with open(os.path.join(render_dir, ".owner"), "w", encoding="utf-8") as handle:
+                    handle.write(str(user_id))
+            _write_resume_manifest(
+                render_id, cmd, priority, user_id, reservation_id,
+                watermark=jobs[render_id]["watermark"],
+                job_type="custom_render",
+            )
+            approved["render_job_id"] = render_id
+            approved["render_status"] = "queued"
+            _save_custom_draft(directory, approved)
+            _enqueue_job(render_id, priority)
+            return {"job_id": render_id, "status": "queued"}
+        except Exception:
+            jobs.pop(render_id, None)
+            try:
+                # Queue submission is part of approval's transaction: if it
+                # fails, leave the original editable draft available to retry.
+                _save_custom_draft(directory, draft)
+            except Exception:
+                pass
+            if reservation_id:
+                try:
+                    await _drop_unstarted_job(reservation_id, render_dir)
+                except Exception:
+                    pass
+            else:
+                shutil.rmtree(render_dir, ignore_errors=True)
+            if os.path.exists(staged_source):
+                try:
+                    os.remove(staged_source)
+                except OSError:
+                    pass
+            raise
+
 # Masks user:password credentials embedded in any URL (e.g. the residential
 # proxy URL that yt-dlp echoes in its verbose debug output) before the line is
 # ever printed to the server console or stored in the job log.
@@ -2674,7 +2850,20 @@ async def run_job(job_id, job_data):
 
         returncode = process.returncode
         
-        if returncode == 0:
+        if returncode == 0 and job_data.get("job_type") == "custom_analysis":
+            draft_path = os.path.join(output_dir, "custom_draft.json")
+            try:
+                with open(draft_path, "r", encoding="utf-8") as f:
+                    draft = json.load(f)
+                if draft.get("id") != job_id or not draft.get("clips"):
+                    raise ValueError("custom draft missing its id or clip proposals")
+                jobs[job_id]["status"] = "completed"
+                jobs[job_id]["result"] = {"custom_draft_id": job_id}
+                jobs[job_id]["logs"].append("Campaign analysis ready for review; no clips were rendered.")
+            except Exception as e:
+                jobs[job_id]["status"] = "failed"
+                jobs[job_id]["logs"].append(f"Custom campaign analysis did not produce a valid draft: {e}")
+        elif returncode == 0:
             jobs[job_id]['status'] = 'completed'
             jobs[job_id]['logs'].append("Process finished successfully.")
             
@@ -2747,11 +2936,27 @@ async def health_ready():
 
 @app.get("/api/config")
 async def get_config():
+    campaign_ai_models = [{
+        "id": "gemini",
+        "provider": "Gemini",
+        "model": os.environ.get("GEMINI_MODEL") or "gemini-3.1-flash-lite",
+    }]
+    if not BILLING_ENABLED and llm_backend.base_url():
+        campaign_ai_models.append({
+            "id": "openai-compatible",
+            "provider": "OpenAI-compatible",
+            "model": llm_backend.model_name(),
+        })
+    default_campaign_ai_provider = (
+        "openai-compatible" if not BILLING_ENABLED and llm_backend.active() else "gemini"
+    )
     return {
         "youtubeUrlEnabled": not DISABLE_YOUTUBE_URL,
         "billingEnabled": BILLING_ENABLED,
         "googleAuthEnabled": bool(BILLING_ENABLED and cloud.settings.google_auth_enabled),
         "jobRetentionSeconds": JOB_RETENTION_SECONDS,
+        "campaignAiModels": campaign_ai_models,
+        "defaultCampaignAiProvider": default_campaign_ai_provider,
         # Self-host only: tells the dashboard the Gemini key is optional
         # because the moment picker runs on an OpenAI-compatible server.
         "localLlm": None if BILLING_ENABLED else llm_backend.describe(),
@@ -3023,6 +3228,762 @@ def layout_env(requested):
             env[extra] = "1"
     return env
 
+
+# ---------------------------------------------------------------------------
+# Campaign workspace: long-lived containers for content-rewards clipping.
+# A campaign holds the parsed rules, reusable assets and the draft analyses
+# made from it; the analysis pipeline itself is unchanged.
+# ---------------------------------------------------------------------------
+
+class CampaignUpsertRequest(BaseModel):
+    name: str = Field(default="", max_length=120)
+    platform: str = Field(default="", max_length=200)
+    reward: str = Field(default="", max_length=200)
+    deadline: str = Field(default="", max_length=200)
+    brief_link: str = Field(default="", max_length=500)
+    guideline_text: str = Field(default="", max_length=50_000)
+    guideline_url: str = Field(default="", max_length=500)
+    rules: Optional[List[dict]] = None
+
+
+class CampaignParseRequest(BaseModel):
+    guideline_text: Optional[str] = Field(default=None, max_length=50_000)
+    guideline_url: Optional[str] = Field(default=None, max_length=500)
+
+
+class CampaignAssetFromUrlRequest(BaseModel):
+    url: str = Field(min_length=1, max_length=2000)
+    kind: str = Field(default="other", max_length=20)
+    note: str = Field(default="", max_length=1000)
+
+
+async def _download_asset_from_url(url: str, assets_dir: str, *, max_bytes: int) -> str:
+    """Stream a public URL into the campaign's assets dir; return the stored name.
+
+    Direct file URLs only (same guard the guideline fetcher uses). YouTube
+    pages are not file URLs — source video belongs in the analysis upload.
+    """
+    import httpx
+    from urllib.parse import unquote, urljoin, urlparse
+    from security_utils import assert_public_url
+    from custom_campaign import normalize_drive_url
+
+    current = assert_public_url(normalize_drive_url(url))
+    stored = None
+    async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0), follow_redirects=False, trust_env=False) as client:
+        target = current
+        for _ in range(6):
+            request = client.build_request("GET", target)
+            response = await client.send(request, stream=True)
+            if response.status_code in {301, 302, 303, 307, 308}:
+                location = response.headers.get("location")
+                await response.aclose()
+                if not location:
+                    raise HTTPException(status_code=422, detail="Asset URL redirect has no destination")
+                target = urljoin(target, location)
+                assert_public_url(target)
+                continue
+            if response.status_code >= 400:
+                hint = ""
+                if "drive" in urlparse(target).netloc and response.status_code in (401, 403, 404):
+                    hint = (" Google Drive says this file is not shared publicly — set its "
+                            "sharing to 'Anyone with the link', or upload the file directly.")
+                await response.aclose()
+                raise HTTPException(status_code=422, detail=f"Asset URL returned HTTP {response.status_code}.{hint}")
+            content_type = response.headers.get("content-type", "").split(";", 1)[0].lower()
+            if content_type in {"text/html", "application/xhtml+xml"}:
+                # Drive's virus-scan interstitial answers with a confirm link.
+                head = await response.aread()
+                await response.aclose()
+                html = head.decode("utf-8", errors="replace")
+                if "drive" in urlparse(target).netloc and "confirm=t" in html:
+                    match = re.search(
+                        r"https://drive\.usercontent\.google\.com/download\?[^\s<>]*confirm=t[^\s<>]*", html
+                    )
+                    if match:
+                        target = match.group(0).replace("&amp;", "&")
+                        assert_public_url(target)
+                        continue
+                raise HTTPException(status_code=422, detail="That link returned a webpage, not a file — use a direct file URL or upload the file.")
+            declared = response.headers.get("content-length")
+            if declared and int(declared) > max_bytes:
+                await response.aclose()
+                raise HTTPException(status_code=413, detail=f"Asset too large. Max size {max_bytes // (1024 * 1024)}MB")
+            safe = os.path.basename(unquote(urlparse(str(response.url)).path).replace("\\", "/")) or "asset"
+            stored = f"{uuid.uuid4()}_{safe}"[:300]
+            path = os.path.join(assets_dir, stored)
+            size = 0
+            try:
+                with open(path, "wb") as output:
+                    async for chunk in response.aiter_bytes(1024 * 1024):
+                        size += len(chunk)
+                        if size > max_bytes:
+                            raise HTTPException(status_code=413, detail=f"Asset too large. Max size {max_bytes // (1024 * 1024)}MB")
+                        output.write(chunk)
+            except HTTPException:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+                raise
+            finally:
+                await response.aclose()
+            break
+        else:
+            raise HTTPException(status_code=422, detail="Asset URL redirected too many times")
+    return stored
+
+
+def _campaign_owner_id(campaign_id: str) -> Optional[str]:
+    try:
+        owner_path = os.path.join(campaigns.campaign_dir(campaign_id), ".owner")
+    except campaigns.CampaignNotFoundError:
+        return None
+    try:
+        with open(owner_path, "r", encoding="utf-8") as handle:
+            return handle.read().strip() or None
+    except OSError:
+        return None
+
+
+def _load_campaign_or_404(campaign_id: str) -> tuple[str, dict]:
+    try:
+        return campaigns.load_campaign(campaign_id)
+    except campaigns.CampaignNotFoundError:
+        raise HTTPException(status_code=404, detail="Campaign not found") from None
+    except campaigns.CampaignValidationError:
+        raise HTTPException(status_code=500, detail="Could not read the saved campaign") from None
+
+
+async def _assert_campaign_owner(request: Request, campaign_id: str) -> str:
+    try:
+        directory = campaigns.campaign_dir(campaign_id)
+    except campaigns.CampaignNotFoundError:
+        raise HTTPException(status_code=404, detail="Campaign not found") from None
+    record = {}
+    owner_path = os.path.join(directory, ".owner")
+    try:
+        with open(owner_path, "r", encoding="utf-8") as handle:
+            record["user_id"] = handle.read().strip()
+    except FileNotFoundError:
+        if BILLING_ENABLED:
+            raise HTTPException(status_code=404, detail="Campaign not found") from None
+    await _assert_job_owner(request, record)
+    return directory
+
+
+@app.post("/api/campaigns")
+async def create_campaign_endpoint(body: CampaignUpsertRequest, request: Request):
+    try:
+        campaign = campaigns.create_campaign(
+            name=body.name,
+            platform=body.platform,
+            reward=body.reward,
+            deadline=body.deadline,
+            brief_link=body.brief_link,
+            guideline_text=body.guideline_text,
+            guideline_url=body.guideline_url,
+        )
+        if body.rules is not None:
+            campaigns.set_rules(campaign, body.rules)
+    except campaigns.CampaignValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    directory = campaigns.campaign_dir(campaign["id"])
+    try:
+        os.makedirs(directory, exist_ok=False)
+    except OSError:
+        raise HTTPException(status_code=500, detail="Could not create the campaign directory") from None
+    user = await _user_from_request(request)
+    if user is not None:
+        with open(os.path.join(directory, ".owner"), "w", encoding="utf-8") as handle:
+            handle.write(str(user.id))
+    campaigns.save_campaign(directory, campaign)
+    return campaigns.public_view(campaign)
+
+
+@app.get("/api/campaigns")
+async def list_campaigns_endpoint(request: Request):
+    items = campaigns.list_campaigns()
+    if BILLING_ENABLED:
+        user = await _user_from_request(request)
+        if user is None:
+            items = []
+        else:
+            owner = str(user.id)
+            items = [item for item in items if _campaign_owner_id(item["id"]) == owner]
+    return {"campaigns": items}
+
+
+@app.get("/api/campaigns/{campaign_id}")
+async def get_campaign_endpoint(campaign_id: str, request: Request):
+    directory = await _assert_campaign_owner(request, campaign_id)
+    _, campaign = _load_campaign_or_404(campaign_id)
+    return campaigns.public_view(campaign)
+
+
+@app.put("/api/campaigns/{campaign_id}")
+async def update_campaign_endpoint(campaign_id: str, body: CampaignUpsertRequest, request: Request):
+    directory = await _assert_campaign_owner(request, campaign_id)
+    _, campaign = _load_campaign_or_404(campaign_id)
+    changes = body.dict()
+    try:
+        campaigns.revise_campaign(campaign, changes)
+    except campaigns.CampaignValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    campaigns.save_campaign(directory, campaign)
+    return campaigns.public_view(campaign)
+
+
+@app.delete("/api/campaigns/{campaign_id}")
+async def delete_campaign_endpoint(campaign_id: str, request: Request):
+    directory = await _assert_campaign_owner(request, campaign_id)
+    _load_campaign_or_404(campaign_id)  # 404 when missing/corrupt
+    campaigns.delete_campaign(directory)
+    return {"ok": True}
+
+
+@app.post("/api/campaigns/{campaign_id}/parse-guideline")
+async def parse_campaign_guideline_endpoint(campaign_id: str, body: CampaignParseRequest, request: Request):
+    """Turn the stored (or newly pasted) guideline into structured rules."""
+    directory = await _assert_campaign_owner(request, campaign_id)
+    _, campaign = _load_campaign_or_404(campaign_id)
+    body_text = (body.guideline_text or "").strip()
+    body_url = (body.guideline_url or "").strip()
+    # An explicitly pasted URL wins over previously stored text: the caller
+    # asked for a fresh fetch of that link.
+    guideline_text = body_text if body_url and not body_text else (body_text or str(campaign.get("guideline_text") or "").strip())
+    guideline_url = body_url or str(campaign.get("guideline_url") or "").strip()
+    if guideline_url and not guideline_text:
+        try:
+            guideline_text = await asyncio.get_event_loop().run_in_executor(
+                None, fetch_guideline_text, guideline_url
+            )
+        except DraftValidationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=f"Could not fetch the guideline URL: {exc}") from None
+    if not guideline_text:
+        raise HTTPException(status_code=422, detail="Save the campaign guideline first or paste one in the request.")
+    selected_provider = (
+        "openai-compatible" if not BILLING_ENABLED and llm_backend.active() else "gemini"
+    )
+    key = await resolve_gemini(request) if selected_provider == "gemini" else None
+    try:
+        parsed = await asyncio.get_event_loop().run_in_executor(
+            None,
+            functools.partial(
+                parse_campaign_guideline,
+                guideline_text,
+                api_key=key,
+                model=os.environ.get("GEMINI_MODEL"),
+                provider=selected_provider,
+            ),
+        )
+        campaigns.set_rules(campaign, parsed.get("rules", []))
+        campaign["guideline_text"] = guideline_text[:campaigns.MAX_GUIDELINE_CHARS]
+        if (body.guideline_url or "").strip():
+            campaign["guideline_url"] = body.guideline_url.strip()
+    except DraftValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    campaigns.save_campaign(directory, campaign)
+    return campaigns.public_view(campaign)
+
+
+@app.post("/api/campaigns/{campaign_id}/parse-guideline-file")
+async def parse_campaign_guideline_file(campaign_id: str, request: Request, file: UploadFile = File(...)):
+    """Extract rules from an uploaded guideline PDF/TXT/Markdown file."""
+    directory = await _assert_campaign_owner(request, campaign_id)
+    _, campaign = _load_campaign_or_404(campaign_id)
+    guide_bytes = await file.read(5 * 1024 * 1024 + 1)
+    if len(guide_bytes) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Guideline file exceeds the 5 MB limit")
+    loop = asyncio.get_event_loop()
+    try:
+        guideline_text = await loop.run_in_executor(
+            None, extract_guideline_text, file.filename or "guideline.pdf", guide_bytes
+        )
+    except DraftValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Could not read the guideline file: {exc}") from None
+    if not str(guideline_text or "").strip():
+        raise HTTPException(status_code=422, detail="The guideline file contains no readable text.")
+    selected_provider = (
+        "openai-compatible" if not BILLING_ENABLED and llm_backend.active() else "gemini"
+    )
+    key = await resolve_gemini(request) if selected_provider == "gemini" else None
+    try:
+        parsed = await loop.run_in_executor(
+            None,
+            functools.partial(
+                parse_campaign_guideline,
+                str(guideline_text),
+                api_key=key,
+                model=os.environ.get("GEMINI_MODEL"),
+                provider=selected_provider,
+            ),
+        )
+        campaigns.set_rules(campaign, parsed.get("rules", []))
+        campaign["guideline_text"] = str(guideline_text)[:campaigns.MAX_GUIDELINE_CHARS]
+    except DraftValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    campaigns.save_campaign(directory, campaign)
+    return campaigns.public_view(campaign)
+
+
+@app.post("/api/campaigns/{campaign_id}/assets")
+async def add_campaign_asset(
+    campaign_id: str,
+    request: Request,
+    file: UploadFile = File(...),
+    kind: str = Form("other"),
+    note: str = Form(""),
+):
+    directory = await _assert_campaign_owner(request, campaign_id)
+    _, campaign = _load_campaign_or_404(campaign_id)
+    asset_id = str(uuid.uuid4())
+    stored_name = f"{asset_id}_{campaigns.safe_filename(file.filename)}"
+    if stored_name == f"{asset_id}_":
+        raise HTTPException(status_code=422, detail="Asset file has no name")
+    assets_dir = os.path.join(directory, "assets")
+    os.makedirs(assets_dir, exist_ok=True)
+    path = os.path.join(assets_dir, stored_name)
+    size = 0
+    limit_bytes = MAX_FILE_SIZE_MB * 1024 * 1024
+    try:
+        with open(path, "wb") as output:
+            while chunk := await file.read(1024 * 1024):
+                size += len(chunk)
+                if size > limit_bytes:
+                    raise HTTPException(status_code=413, detail=f"Asset too large. Max size {MAX_FILE_SIZE_MB}MB")
+                output.write(chunk)
+        campaigns.add_asset(campaign, asset_id=asset_id, kind=kind, filename=stored_name, note=note)
+    except HTTPException:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        raise
+    except campaigns.CampaignValidationError as exc:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    campaigns.save_campaign(directory, campaign)
+    return campaigns.public_view(campaign)
+
+
+@app.post("/api/campaigns/{campaign_id}/assets-from-url")
+async def add_campaign_asset_from_url(campaign_id: str, body: CampaignAssetFromUrlRequest, request: Request):
+    """Register a public file URL as a campaign asset (downloaded server-side)."""
+    directory = await _assert_campaign_owner(request, campaign_id)
+    _, campaign = _load_campaign_or_404(campaign_id)
+    assets_dir = os.path.join(directory, "assets")
+    os.makedirs(assets_dir, exist_ok=True)
+    try:
+        stored_name = await _download_asset_from_url(
+            body.url, assets_dir, max_bytes=MAX_FILE_SIZE_MB * 1024 * 1024
+        )
+    except HTTPException:
+        raise
+    except campaigns.CampaignValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Could not download the asset: {exc}") from None
+    try:
+        campaigns.add_asset(campaign, asset_id=str(uuid.uuid4()), kind=body.kind, filename=stored_name, note=body.note)
+    except campaigns.CampaignValidationError as exc:
+        try:
+            os.remove(os.path.join(assets_dir, stored_name))
+        except OSError:
+            pass
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    campaigns.save_campaign(directory, campaign)
+    return campaigns.public_view(campaign)
+
+
+@app.delete("/api/campaigns/{campaign_id}/assets/{asset_id}")
+async def delete_campaign_asset(campaign_id: str, asset_id: str, request: Request):
+    directory = await _assert_campaign_owner(request, campaign_id)
+    _, campaign = _load_campaign_or_404(campaign_id)
+    try:
+        asset = campaigns.remove_asset(campaign, asset_id)
+    except campaigns.CampaignValidationError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from None
+    try:
+        os.remove(campaigns.asset_path(directory, asset))
+    except (OSError, campaigns.CampaignValidationError):
+        pass  # the record is gone either way; a stray file is harmless
+    campaigns.save_campaign(directory, campaign)
+    return campaigns.public_view(campaign)
+
+
+@app.post("/api/custom/analyze")
+async def custom_analyze_endpoint(
+    request: Request,
+    file: Optional[UploadFile] = File(None),
+    url: Optional[str] = Form(None),
+    guideline_file: Optional[UploadFile] = File(None),
+    guideline_url: Optional[str] = Form(None),
+    guideline_text: Optional[str] = Form(None),
+    acknowledged: Optional[str] = Form(None),
+    ai_provider: Optional[str] = Form(None),
+    campaign_id: Optional[str] = Form(None),
+):
+    """Create a campaign-analysis job. This endpoint never renders clips."""
+    api_key = await resolve_gemini(request)
+    selected_provider = (ai_provider or "").strip() or (
+        "openai-compatible" if not BILLING_ENABLED and llm_backend.active() else "gemini"
+    )
+    if selected_provider == "openai-compatible":
+        if BILLING_ENABLED or not llm_backend.base_url():
+            raise HTTPException(status_code=400, detail="OpenAI-compatible AI is not configured on this server.")
+        selected_model = llm_backend.model_name()
+    elif selected_provider == "gemini":
+        if not api_key:
+            raise gemini_missing_error()
+        selected_model = os.environ.get("GEMINI_MODEL") or "gemini-3.1-flash-lite"
+    else:
+        raise HTTPException(status_code=400, detail="Unsupported campaign AI provider.")
+    if str(acknowledged).lower() not in ("1", "true", "yes"):
+        raise HTTPException(status_code=400, detail="Confirm that you own the source or have rights to use it.")
+    if bool(file) == bool(url):
+        raise HTTPException(status_code=400, detail="Provide exactly one source video file or URL.")
+    campaign = None
+    if campaign_id:
+        try:
+            _, campaign = campaigns.load_campaign(campaign_id)
+        except campaigns.CampaignNotFoundError:
+            raise HTTPException(status_code=404, detail="Campaign not found") from None
+    guide_count = sum(bool(value) for value in (guideline_file, guideline_url, guideline_text and guideline_text.strip()))
+    if campaign_id:
+        # The campaign's stored guideline can stand in for a pasted/uploaded one.
+        if guide_count > 1:
+            raise HTTPException(status_code=400, detail="Provide exactly one guideline file, public URL, or text brief.")
+        if guide_count == 0 and not str(campaign.get("guideline_text") or "").strip():
+            raise HTTPException(status_code=422, detail="This campaign has no guideline text yet; add it before analyzing.")
+    elif guide_count != 1:
+        raise HTTPException(status_code=400, detail="Provide exactly one guideline file, public URL, or text brief.")
+
+    if url:
+        if DISABLE_YOUTUBE_URL:
+            raise HTTPException(status_code=403, detail="URL ingest is disabled on this deployment. Upload a source you own.")
+        await _validate_source_url(url)
+
+    loop = asyncio.get_event_loop()
+    try:
+        if guideline_file:
+            guide_bytes = await guideline_file.read(5 * 1024 * 1024 + 1)
+            guide = await loop.run_in_executor(
+                None, extract_guideline_text, guideline_file.filename or "guideline.pdf", guide_bytes
+            )
+        elif guideline_url:
+            guide = await loop.run_in_executor(None, fetch_guideline_text, guideline_url)
+        else:
+            guide = (guideline_text or "").strip()
+            if len(guide.encode("utf-8")) > 5 * 1024 * 1024:
+                raise DraftValidationError("Guideline text exceeds the 5 MB limit")
+            if not guide and not campaign_id:
+                # With a campaign selected its stored guideline supplies the text.
+                raise DraftValidationError("Guideline text is empty")
+    except DraftValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Could not read the guideline: {exc}")
+
+    if campaign is not None:
+        if not guide and campaign.get("guideline_text"):
+            guide = campaign["guideline_text"]
+        rules_block = campaigns.rules_prompt_block(campaign)
+        if rules_block:
+            guide = f"{guide}\n\n{rules_block}" if guide else rules_block
+        if not guide.strip():
+            raise HTTPException(status_code=422, detail="This campaign has no guideline text yet; add it before analyzing.")
+
+    job_id = str(uuid.uuid4())
+    job_output_dir = os.path.join(OUTPUT_DIR, job_id)
+    os.makedirs(job_output_dir, exist_ok=False)
+    guideline_path = os.path.join(job_output_dir, "campaign_guideline.txt")
+    with open(guideline_path, "w", encoding="utf-8") as handle:
+        handle.write(guide)
+
+    input_path = None
+    reservation_id = None
+    try:
+        if file:
+            safe_name = os.path.basename(file.filename or "source.mp4") or "source.mp4"
+            input_path = os.path.join(UPLOAD_DIR, f"{job_id}_{safe_name}")
+            size = 0
+            limit_bytes = MAX_FILE_SIZE_MB * 1024 * 1024
+            with open(input_path, "wb") as output:
+                while chunk := await file.read(1024 * 1024):
+                    size += len(chunk)
+                    if size > limit_bytes:
+                        raise HTTPException(status_code=413, detail=f"File too large. Max size {MAX_FILE_SIZE_MB}MB")
+                    output.write(chunk)
+            # Do not apply the legacy minimum-source gate here: campaign
+            # analysis can identify a valid short-form excerpt in short video.
+
+        user_id, priority, reservation_id, user_plan, partial = await reserve_process_minutes(
+            request, url, input_path, job_id
+        )
+        env = child_env()
+        env.setdefault("PYTHONIOENCODING", "utf-8")
+        env["CAMPAIGN_AI_PROVIDER"] = selected_provider
+        env["CAMPAIGN_AI_MODEL"] = selected_model
+        if api_key:
+            env["GEMINI_API_KEY"] = api_key
+        else:
+            env.pop("GEMINI_API_KEY", None)
+        if partial:
+            env["MAX_SOURCE_MINUTES"] = str(partial["processed_minutes"])
+            env.pop("SOURCE_CAP_MINUTES", None)
+        elif url and getattr(request.state, "reserved_minutes", None):
+            env["SOURCE_CAP_MINUTES"] = str(request.state.reserved_minutes)
+        else:
+            env.pop("SOURCE_CAP_MINUTES", None)
+        if getattr(request.state, "skip_statics", False):
+            env["DOWNLOAD_SKIP_STATICS"] = "1"
+        else:
+            env.pop("DOWNLOAD_SKIP_STATICS", None)
+
+        cmd = [sys.executable, "-u", "main.py"]
+        if url:
+            cmd.extend(["-u", url, "--keep-original"])
+        else:
+            cmd.extend(["-i", input_path])
+        cmd.extend([
+            "-o", job_output_dir,
+            "--custom-analyze",
+            "--campaign-guideline", guideline_path,
+            "--draft-id", job_id,
+        ])
+        jobs[job_id] = {
+            "status": "queued",
+            "logs": _TimedLog([f"Custom campaign analysis {job_id} queued."]),
+            "cmd": cmd,
+            "env": env,
+            "output_dir": job_output_dir,
+            "user_id": user_id,
+            "reservation_id": reservation_id,
+            "watermark": user_plan == "free",
+            "partial": partial,
+            "job_type": "custom_analysis",
+            "source_url": url,
+            "user_plan": user_plan,
+        }
+        if user_plan == "free":
+            env["WATERMARK"] = "1"
+        if user_id is not None:
+            with open(os.path.join(job_output_dir, ".owner"), "w", encoding="utf-8") as handle:
+                handle.write(str(user_id))
+        _write_resume_manifest(
+            job_id, cmd, priority, user_id, reservation_id,
+            watermark=jobs[job_id]["watermark"],
+            partial=partial,
+            source_cap_minutes=getattr(request.state, "reserved_minutes", None) if url and not partial else None,
+            skip_statics=bool(url) and bool(getattr(request.state, "skip_statics", False)),
+            job_type="custom_analysis",
+        )
+        if campaign is not None:
+            campaigns.attach_draft(campaign, job_id)
+            campaigns.save_campaign(campaigns.campaign_dir(campaign["id"]), campaign)
+        _enqueue_job(job_id, priority)
+        return {
+            "draft_id": job_id,
+            "job_id": job_id,
+            "status": "queued",
+            "campaign_id": campaign["id"] if campaign is not None else None,
+        }
+    except Exception:
+        if reservation_id:
+            await _drop_unstarted_job(reservation_id, job_output_dir)
+        else:
+            shutil.rmtree(job_output_dir, ignore_errors=True)
+        jobs.pop(job_id, None)
+        if input_path and os.path.exists(input_path):
+            try:
+                os.remove(input_path)
+            except OSError:
+                pass
+        raise
+
+
+def _custom_draft_dir(draft_id: str) -> str:
+    try:
+        canonical_id = str(uuid.UUID(draft_id))
+    except (TypeError, ValueError, AttributeError):
+        raise HTTPException(status_code=404, detail="Draft not found")
+    return os.path.join(OUTPUT_DIR, canonical_id)
+
+
+def _read_custom_draft(draft_id: str) -> tuple[str, dict]:
+    directory = _custom_draft_dir(draft_id)
+    path = os.path.join(directory, "custom_draft.json")
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            draft = json.load(handle)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Draft analysis is not ready")
+    except (OSError, json.JSONDecodeError):
+        raise HTTPException(status_code=500, detail="Could not read the saved custom draft")
+    if draft.get("id") != os.path.basename(directory):
+        raise HTTPException(status_code=404, detail="Draft not found")
+    return directory, draft
+
+
+def _save_custom_draft(directory: str, draft: dict) -> None:
+    path = os.path.join(directory, "custom_draft.json")
+    temp = path + ".tmp"
+    with open(temp, "w", encoding="utf-8") as handle:
+        json.dump(draft, handle, ensure_ascii=False, indent=2)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temp, path)
+
+
+def _custom_draft_public_view(draft: dict) -> dict:
+    result = copy.deepcopy(draft)
+    for private_key in ("guideline_text", "transcript", "source_video", "approved_clips", "approval_hash", "source_path"):
+        result.pop(private_key, None)
+    return result
+
+
+async def _assert_custom_draft_owner(request: Request, draft_id: str) -> str:
+    directory = _custom_draft_dir(draft_id)
+    record = jobs.get(str(uuid.UUID(draft_id))) or {}
+    owner_path = os.path.join(directory, ".owner")
+    try:
+        with open(owner_path, "r", encoding="utf-8") as handle:
+            record["user_id"] = handle.read().strip()
+    except FileNotFoundError:
+        if BILLING_ENABLED and record.get("user_id") is None:
+            raise HTTPException(status_code=404, detail="Not found")
+    await _assert_job_owner(request, record)
+    return directory
+
+
+def _custom_source_path(draft_id: str, directory: str, draft: dict) -> str:
+    # Uploaded video remains in uploads/{draft_id}_*. URL video is retained in
+    # the draft's output directory by the worker's --keep-original option.
+    uploaded = [
+        path for path in glob.glob(os.path.join(UPLOAD_DIR, f"{glob.escape(draft_id)}_*"))
+        if not os.path.basename(path).startswith("thumb_")
+    ]
+    if uploaded:
+        return uploaded[0]
+    source_name = os.path.basename(str(draft.get("source_video") or ""))
+    candidate = os.path.realpath(os.path.join(directory, source_name))
+    root = os.path.realpath(directory) + os.sep
+    if source_name and candidate.startswith(root) and os.path.isfile(candidate):
+        return candidate
+    return ""
+
+
+@app.get("/api/custom/drafts/{draft_id}/source-url")
+async def custom_draft_source_url(draft_id: str, request: Request):
+    """Return a player URL after checking the draft owner."""
+    try:
+        canonical_id = str(uuid.UUID(draft_id))
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Not found") from None
+    directory = await _assert_custom_draft_owner(request, canonical_id)
+    _, draft = _read_custom_draft(canonical_id)
+    source_path = _custom_source_path(canonical_id, directory, draft)
+    if not source_path or not os.path.isfile(source_path):
+        raise HTTPException(status_code=410, detail="Source video expired; analyze it again to preview.")
+    source_url = f"/api/custom/drafts/{canonical_id}/source"
+    if BILLING_ENABLED:
+        exp = int(time.time()) + SOURCE_URL_TTL_SECONDS
+        source_url += f"?exp={exp}&sig={_source_signature(canonical_id, exp)}"
+    return {"url": source_url}
+
+
+@app.get("/api/custom/drafts/{draft_id}/source")
+async def custom_draft_source(
+    draft_id: str, request: Request, exp: int = 0, sig: str = ""
+):
+    """Stream the private source for video preview; enforce owner or signed URL."""
+    try:
+        canonical_id = str(uuid.UUID(draft_id))
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Not found") from None
+    signed = (
+        BILLING_ENABLED
+        and bool(sig)
+        and exp > time.time()
+        and hmac.compare_digest(sig, _source_signature(canonical_id, exp))
+    )
+    if not signed:
+        directory = await _assert_custom_draft_owner(request, canonical_id)
+    else:
+        directory = _custom_draft_dir(canonical_id)
+    _, draft = _read_custom_draft(canonical_id)
+    source_path = _custom_source_path(canonical_id, directory, draft)
+    if not source_path or not os.path.isfile(source_path):
+        raise HTTPException(status_code=410, detail="Source video expired; analyze it again to preview.")
+    return FileResponse(
+        source_path,
+        media_type=mimetypes.guess_type(source_path)[0] or "video/mp4",
+        headers={"Cache-Control": "private, no-store"},
+    )
+
+
+@app.get("/api/custom/drafts/{draft_id}")
+async def get_custom_draft(draft_id: str, request: Request):
+    directory = await _assert_custom_draft_owner(request, draft_id)
+    _, draft = _read_custom_draft(draft_id)
+    job = jobs.get(str(uuid.UUID(draft_id))) or {}
+    result = _custom_draft_public_view(draft)
+    result["analysis_status"] = job.get("status", draft.get("status"))
+    return result
+
+
+@app.post("/api/custom/drafts/{draft_id}/chat")
+async def discuss_custom_draft(draft_id: str, body: CustomChatRequest, request: Request):
+    directory = await _assert_custom_draft_owner(request, draft_id)
+    directory, draft = _read_custom_draft(draft_id)
+    if draft.get("status") != "draft":
+        raise HTTPException(status_code=409, detail="Only an unapproved draft can be discussed.")
+    message = body.message.strip()
+    if not message or len(message) > 4000:
+        raise HTTPException(status_code=400, detail="Message must be 1–4000 characters.")
+    if body.revision != draft.get("revision"):
+        raise HTTPException(status_code=409, detail="Draft changed; refresh before sending another message.")
+    key = await resolve_gemini(request)
+    try:
+        loop = asyncio.get_event_loop()
+        generated = await loop.run_in_executor(
+            None,
+            functools.partial(
+                generate_campaign_chat,
+                api_key=key,
+                draft=draft,
+                message=message,
+                guideline_text=draft.get("guideline_text", ""),
+                provider=draft.get("ai_provider"),
+                model=draft.get("ai_model"),
+            ),
+        )
+        normalized = normalize_campaign_response(
+            generated, draft.get("video_duration", 0), transcript=draft.get("transcript")
+        )
+        updated = revise_draft(draft, normalized)
+    except DraftValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Campaign discussion failed: {exc}")
+    history = list(draft.get("chat_history") or [])
+    history.extend([{"role": "user", "content": message}, {"role": "assistant", "content": str(generated.get("reply") or "") }])
+    updated["chat_history"] = history[-20:]
+    updated["last_reply"] = str(generated.get("reply") or "")
+    updated["guideline_text"] = draft.get("guideline_text", "")
+    updated["transcript"] = draft.get("transcript")
+    updated["video_duration"] = draft.get("video_duration")
+    updated["source_video"] = draft.get("source_video")
+    _save_custom_draft(directory, updated)
+    return {"reply": updated["last_reply"], "draft": _custom_draft_public_view(updated)}
 
 @app.post("/api/process")
 async def process_endpoint(

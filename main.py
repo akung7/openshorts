@@ -28,6 +28,7 @@ import gemini_worker
 import hook_grounding
 import layout_picker
 import llm_backend
+from custom_campaign import create_campaign_draft, generate_campaign_analysis
 from clip_selection import (build_transcript_windows, clip_count_targets,
                             clip_duration_bounds, dedupe_overlapping,
                             score_batches, shortlist_target,
@@ -2191,8 +2192,22 @@ if __name__ == '__main__':
                         help="Output aspect: vertical/auto (9:16), horizontal (keep 16:9), square (1:1).")
     parser.add_argument('--transcript', type=str,
                         help="Path to a precomputed transcript JSON (transcribe_media shape); skips transcription.")
+    parser.add_argument('--custom-analyze', action='store_true',
+                        help="Analyze campaign candidates and save a draft without rendering.")
+    parser.add_argument('--campaign-guideline', type=str,
+                        help="Path to the campaign guideline text for --custom-analyze.")
+    parser.add_argument('--draft-id', type=str,
+                        help="Server-generated draft id for --custom-analyze.")
+    parser.add_argument('--custom-render-plan', type=str,
+                        help="Path to a server-approved custom render plan JSON.")
 
     args = parser.parse_args()
+    if args.custom_analyze and args.custom_render_plan:
+        parser.error("--custom-analyze and --custom-render-plan are mutually exclusive")
+    if args.custom_analyze and (not args.campaign_guideline or not args.draft_id):
+        parser.error("--custom-analyze requires --campaign-guideline and --draft-id")
+    if args.custom_render_plan and args.url:
+        parser.error("--custom-render-plan requires a staged local input file")
     output_format = args.format
 
     script_start_time = time.time()
@@ -2252,7 +2267,8 @@ if __name__ == '__main__':
             threading.Thread(target=_early_work, args=(audio_path, audio_duration),
                              daemon=True).start()
 
-        use_early = (not args.skip_analysis and not args.transcript
+        use_early = (not args.skip_analysis and not args.custom_analyze
+                     and not args.custom_render_plan and not args.transcript
                      and os.environ.get("EARLY_AUDIO", "1").strip() != "0"
                      and not os.environ.get("MAX_SOURCE_MINUTES", "").strip()
                      and not os.path.exists(os.path.join(output_dir, TRANSCRIPT_CHECKPOINT)))
@@ -2301,7 +2317,7 @@ if __name__ == '__main__':
     # instead of one per clip, and the answer is a property of the material
     # ("this is a screencast"), which does not change between its own clips.
     # It runs before any render so the modules are switched on in time.
-    if layout_picker.ENABLED:
+    if not args.custom_analyze and not args.custom_render_plan and layout_picker.ENABLED:
         try:
             _cap = cv2.VideoCapture(input_video)
             _fps = _cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -2389,16 +2405,74 @@ if __name__ == '__main__':
                   f"switching to visual analysis.")
             transcript = None
 
-        # 4. Gemini Analysis (transcript-driven, or vision for silent videos)
-        early_clips = (early_state or {}).get("clips") if early_state else None
-        if (transcript is not None and early_clips
-                and transcript is early_state["transcript"]):
-            print("♻️ Using the clips Gemini picked while the video downloaded.")
-            clips_data = early_clips
-        elif transcript is not None:
-            clips_data = get_viral_clips(transcript, duration)
+        # Custom analyze is a proposal-only path: write a draft and exit before
+        # the renderer is entered. It deliberately never calls the viral picker.
+        if args.custom_analyze:
+            if transcript is None:
+                raise RuntimeError("Custom campaign analysis needs a transcript; silent footage is not yet supported in this mode.")
+            with open(args.campaign_guideline, "r", encoding="utf-8") as guideline_file:
+                guideline_text = guideline_file.read(50_001).strip()
+            if not guideline_text:
+                raise RuntimeError("Campaign guideline file is empty.")
+            response = generate_campaign_analysis(
+                api_key=os.environ.get("GEMINI_API_KEY"),
+                transcript=transcript,
+                video_duration=duration,
+                guideline_text=guideline_text,
+                provider=os.environ.get("CAMPAIGN_AI_PROVIDER") or None,
+                model=os.environ.get("CAMPAIGN_AI_MODEL") or None,
+            )
+            draft = create_campaign_draft(
+                draft_id=args.draft_id,
+                video_duration=duration,
+                transcript=transcript,
+                guideline_text=guideline_text,
+                source_video=os.path.basename(input_video),
+                response=response,
+            )
+            draft["ai_provider"] = os.environ.get("CAMPAIGN_AI_PROVIDER", "") or (
+                "openai-compatible" if llm_backend.active() else "gemini"
+            )
+            draft["ai_model"] = os.environ.get("CAMPAIGN_AI_MODEL", "") or (
+                llm_backend.model_name() if draft["ai_provider"] == "openai-compatible"
+                else os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-lite")
+            )
+            draft_path = os.path.join(output_dir, "custom_draft.json")
+            with open(draft_path, "w", encoding="utf-8") as draft_file:
+                json.dump(draft, draft_file, ensure_ascii=False, indent=2)
+            print(f"CUSTOM_DRAFT_READY {draft_path}")
+            print("Campaign analysis finished without rendering clips.")
+            raise SystemExit(0)
+
+        if args.custom_render_plan:
+            with open(args.custom_render_plan, "r", encoding="utf-8") as plan_file:
+                approved_plan = json.load(plan_file)
+            planned_clips = approved_plan.get("clips") if isinstance(approved_plan, dict) else None
+            if not isinstance(planned_clips, list) or not planned_clips or len(planned_clips) > 50:
+                raise RuntimeError("Approved custom render plan must contain 1–50 clips.")
+            for clip in planned_clips:
+                if not isinstance(clip, dict):
+                    raise RuntimeError("Approved custom render plan contains an invalid clip.")
+                try:
+                    start, end = float(clip["start"]), float(clip["end"])
+                except (KeyError, TypeError, ValueError):
+                    raise RuntimeError("Approved custom render plan has invalid timestamps.") from None
+                if not math.isfinite(start) or not math.isfinite(end) or start < 0 or end <= start or end > duration:
+                    raise RuntimeError("Approved custom render plan contains an out-of-range clip.")
+                clip["start"], clip["end"] = start, end
+            transcript = approved_plan.get("transcript") or {"language": "none", "segments": []}
+            clips_data = {"shorts": planned_clips}
         else:
-            clips_data = get_visual_clips(input_video, duration)
+            # The original Clip Generator analysis path remains unchanged.
+            early_clips = (early_state or {}).get("clips") if early_state else None
+            if (transcript is not None and early_clips
+                    and transcript is early_state["transcript"]):
+                print("♻️ Using the clips Gemini picked while the video downloaded.")
+                clips_data = early_clips
+            elif transcript is not None:
+                clips_data = get_viral_clips(transcript, duration)
+            else:
+                clips_data = get_visual_clips(input_video, duration)
 
         if not clips_data or 'shorts' not in clips_data:
             # Deliberately fail instead of reframing the whole video: that path
