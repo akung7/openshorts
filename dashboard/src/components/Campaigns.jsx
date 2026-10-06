@@ -12,7 +12,7 @@ const geminiHeaders = () => {
 };
 
 async function sendForm(path, form) {
-  const response = await apiFetch(path, { method: 'POST', body: form });
+  const response = await apiFetch(path, { method: 'POST', body: form, headers: geminiHeaders() });
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
     const detail = typeof payload.detail === 'string' ? payload.detail : `Request failed (${response.status})`;
