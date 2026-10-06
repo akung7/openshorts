@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { AlertCircle, CheckCircle2, Clapperboard, FileText, Loader2, MessageCircle, Play, UploadCloud } from 'lucide-react';
+import { AlertCircle, CheckCircle2, Clapperboard, FileText, Loader2, MessageCircle, Play, Plus, Save, Trash2, UploadCloud } from 'lucide-react';
 import { apiFetch, apiJson } from '../lib/api';
 import { getApiUrl } from '../config';
 
@@ -22,11 +22,15 @@ export default function CustomClips() {
   const [guideFile, setGuideFile] = useState(null);
   const [guideUrl, setGuideUrl] = useState('');
   const [guideText, setGuideText] = useState('');
+  const [campaignAiModels, setCampaignAiModels] = useState([{ id: 'gemini', provider: 'Gemini', model: 'gemini-3.1-flash-lite' }]);
+  const [aiProvider, setAiProvider] = useState('gemini');
   const [rightsAcknowledged, setRightsAcknowledged] = useState(false);
   const [draft, setDraft] = useState(null);
   const [selected, setSelected] = useState([]);
   const [chatMessage, setChatMessage] = useState('');
   const [busyChat, setBusyChat] = useState(false);
+  const [savingEdits, setSavingEdits] = useState(false);
+  const [hasUnsavedEdits, setHasUnsavedEdits] = useState(false);
   const [activeJob, setActiveJob] = useState(null);
   const [statusText, setStatusText] = useState('');
   const [error, setError] = useState('');
@@ -38,6 +42,22 @@ export default function CustomClips() {
     if (guideMode === 'url') return Boolean(guideUrl.trim());
     return Boolean(guideText.trim());
   }, [guideFile, guideMode, guideText, guideUrl]);
+
+  useEffect(() => {
+    let cancelled = false;
+    apiJson('/api/config').then((config) => {
+      if (cancelled) return;
+      const models = Array.isArray(config.campaignAiModels) && config.campaignAiModels.length
+        ? config.campaignAiModels
+        : [{ id: 'gemini', provider: 'Gemini', model: 'gemini-3.1-flash-lite' }];
+      setCampaignAiModels(models);
+      const defaultProvider = models.some((item) => item.id === config.defaultCampaignAiProvider)
+        ? config.defaultCampaignAiProvider
+        : models[0].id;
+      setAiProvider(defaultProvider);
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
 
   useEffect(() => {
     if (!activeJob) return undefined;
@@ -59,6 +79,7 @@ export default function CustomClips() {
               if (cancelled) return;
               setDraft(nextDraft);
               setSelected([]);
+              setHasUnsavedEdits(false);
               setStatusText('Draft ready — review candidates before approving any render.');
             } else {
               const clips = snapshot.result?.clips || [];
@@ -95,9 +116,11 @@ export default function CustomClips() {
       if (guideMode === 'url' && guideUrl.trim()) form.append('guideline_url', guideUrl.trim());
       if (guideMode === 'text') form.append('guideline_text', guideText);
       form.append('acknowledged', rightsAcknowledged ? '1' : '0');
+      form.append('ai_provider', aiProvider);
       const job = await sendForm('/api/custom/analyze', form);
       setDraft(null);
       setSelected([]);
+      setHasUnsavedEdits(false);
       setActiveJob({ id: job.draft_id || job.job_id, kind: 'analysis' });
     } catch (requestError) {
       setStatusText('');
@@ -105,9 +128,65 @@ export default function CustomClips() {
     }
   };
 
+  const updateCandidate = (key, changes) => {
+    setDraft((current) => current ? {
+      ...current,
+      clips: (current.clips || []).map((clip) => (clip.id || clip.clientKey) === key ? { ...clip, ...changes } : clip),
+    } : current);
+    setHasUnsavedEdits(true);
+  };
+
+  const addCandidate = () => {
+    if (!draft || draft.status !== 'draft') return;
+    const key = `manual-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const end = Math.min(15, Number(draft.video_duration) || 15);
+    setDraft((current) => current ? {
+      ...current,
+      clips: [...(current.clips || []), {
+        clientKey: key, start: 0, end, duration: end, title: 'Manual candidate',
+        hook: '', caption: '', pillar: 'Manual', evidence: '', checks: [],
+      }],
+    } : current);
+    setHasUnsavedEdits(true);
+  };
+
+  const removeCandidate = (key) => {
+    setDraft((current) => current ? {
+      ...current,
+      clips: (current.clips || []).filter((clip) => (clip.id || clip.clientKey) !== key),
+    } : current);
+    setSelected((current) => current.filter((id) => id !== key));
+    setHasUnsavedEdits(true);
+  };
+
+  const saveCandidateEdits = async () => {
+    if (!draft || savingEdits || !hasUnsavedEdits) return;
+    setSavingEdits(true);
+    setError('');
+    try {
+      const result = await apiJson(`/api/custom/drafts/${encodeURIComponent(draft.id)}/clips`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          revision: draft.revision,
+          clips: (draft.clips || []).map(({ id, start, end, title, hook, caption, pillar }) => ({ id, start, end, title, hook, caption, pillar })),
+        }),
+      });
+      setDraft(result);
+      const validIds = new Set((result.clips || []).map((clip) => clip.id));
+      setSelected((current) => current.filter((id) => validIds.has(id)));
+      setHasUnsavedEdits(false);
+      setStatusText('Edits saved. Review the refreshed compliance checks and select clips to render.');
+    } catch (requestError) {
+      setError(requestError?.detail || requestError?.message || 'Could not save candidate edits.');
+    } finally {
+      setSavingEdits(false);
+    }
+  };
+
   const sendMessage = async (event) => {
     event.preventDefault();
-    if (!draft || !chatMessage.trim() || busyChat) return;
+    if (!draft || !chatMessage.trim() || busyChat || hasUnsavedEdits) return;
     setBusyChat(true);
     setError('');
     try {
@@ -118,6 +197,7 @@ export default function CustomClips() {
       });
       setDraft(result.draft);
       setSelected([]);
+      setHasUnsavedEdits(false);
       setChatMessage('');
       setStatusText('Draft revised. Please review and select candidates again.');
     } catch (requestError) {
@@ -128,7 +208,7 @@ export default function CustomClips() {
   };
 
   const approveAndRender = async () => {
-    if (!draft || !selected.length || isBusy) return;
+    if (!draft || !selected.length || isBusy || hasUnsavedEdits || savingEdits) return;
     const confirmed = window.confirm(`Render ${selected.length} selected candidate(s)? Only these approved ranges will be rendered.`);
     if (!confirmed) return;
     setError('');
@@ -203,6 +283,16 @@ export default function CustomClips() {
             <p className="text-xs text-muted mt-2">Guidelines are used for this draft only. PDF, plain text, Markdown, or readable public pages are supported.</p>
           </section>
 
+          <section>
+            <label htmlFor="campaign-ai-provider" className="block text-sm font-medium text-ink mb-2">AI model for this campaign</label>
+            <select id="campaign-ai-provider" value={aiProvider} onChange={(e) => setAiProvider(e.target.value)} className="input w-full sm:max-w-md">
+              {campaignAiModels.map((item) => (
+                <option key={item.id} value={item.id}>{item.provider} · {item.model}</option>
+              ))}
+            </select>
+            <p className="text-xs text-muted mt-2">Options come from this server's configuration. OpenAI-compatible includes OpenAI API, OpenRouter, or a local model endpoint when configured.</p>
+          </section>
+
           <label className="flex items-start gap-3 text-sm text-ink2">
             <input type="checkbox" checked={rightsAcknowledged} onChange={(e) => setRightsAcknowledged(e.target.checked)} className="mt-1 accent-[var(--brass)]" />
             <span>I own this source video or have permission to process it.</span>
@@ -224,22 +314,41 @@ export default function CustomClips() {
               <div><p className="eyebrow">DRAFT REVISION {draft.revision}</p><h2 className="text-lg text-ink font-medium mt-1">Campaign review</h2><p className="text-sm text-muted mt-1">{draft.summary}</p></div>
               <span className="badge-ok">{draft.clips?.length || 0} candidates · no render yet</span>
             </div>
+            <p className="text-xs text-muted mt-3">AI: {draft.ai_provider || 'configured provider'} · {draft.ai_model || 'default model'}</p>
             {draft.campaign_rules?.length > 0 && <div className="grid sm:grid-cols-2 gap-2 mt-4">{draft.campaign_rules.map((rule) => <div key={rule.id} className="p-3 rounded-input bg-paper2 border border-rule text-xs"><div className="flex items-center gap-2 text-ink font-medium"><CheckCircle2 size={14} className={rule.status === 'pass' ? 'text-ok' : 'text-warn'} />{rule.label}<span className="ml-auto text-muted uppercase">{rule.status}</span></div><p className="text-muted mt-1">{rule.reason}</p>{rule.evidence && <p className="text-ink2 mt-1">Evidence: {rule.evidence}</p>}</div>)}</div>}
           </div>
 
+          {draft.status === 'draft' && <div className="flex flex-wrap items-center justify-between gap-3 card p-4">
+            <div><h3 className="text-sm font-medium text-ink">Edit clip plan</h3><p className="text-xs text-muted mt-1">Adjust timeline, title, hook and caption. Timing edits may change compliance checks.</p></div>
+            <div className="flex gap-2">
+              <button type="button" onClick={addCandidate} disabled={isBusy || savingEdits || (draft.clips || []).length >= 50} className="btn-quiet px-3 py-2 text-sm disabled:opacity-50"><Plus size={15} />Add manual candidate</button>
+              <button type="button" onClick={saveCandidateEdits} disabled={!hasUnsavedEdits || savingEdits || isBusy} className="btn-primary px-3 py-2 text-sm disabled:opacity-50">{savingEdits ? <Loader2 size={15} className="animate-spin" /> : <Save size={15} />}Save edits</button>
+            </div>
+          </div>}
+          {hasUnsavedEdits && <p className="text-xs text-warn px-1">You have unsaved edits. Save before discussing with AI or approving a render.</p>}
+
           <div className="grid lg:grid-cols-2 gap-3">
             {(draft.clips || []).map((clip, index) => {
+              const key = clip.id || clip.clientKey;
               const checked = selected.includes(clip.id);
-              return <article key={clip.id} className={`card p-4 border transition-colors ${checked ? 'border-brass' : 'border-rule'}`}>
+              const editable = draft.status === 'draft';
+              return <article key={key} className={`card p-4 border transition-colors ${checked ? 'border-brass' : 'border-rule'}`}>
                 <div className="flex items-start gap-3">
-                  <input aria-label={`Select candidate ${index + 1}`} type="checkbox" checked={checked} onChange={() => toggleSelected(clip.id)} disabled={draft.status !== 'draft' || isBusy} className="mt-1 accent-[var(--brass)]" />
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-2 flex-wrap"><span className="eyebrow">{String(index + 1).padStart(2, '0')} · {clip.start}s–{clip.end}s · {clip.duration}s</span><span className="badge-warn">{clip.pillar}</span></div>
-                    <h3 className="text-base font-medium text-ink mt-2">{clip.title}</h3>
-                    <p className="text-sm text-brass mt-2">{clip.hook}</p>
-                    <p className="text-sm text-muted mt-2">{clip.caption}</p>
-                    {clip.evidence && <blockquote className="text-xs text-ink2 border-l-2 border-rule pl-3 mt-3">Source: {clip.evidence}</blockquote>}
-                    {clip.checks?.length > 0 && <ul className="mt-3 space-y-1">{clip.checks.map((check, checkIndex) => <li key={`${check.rule_id}-${checkIndex}`} className="text-xs text-muted flex gap-2"><span className={check.status === 'pass' ? 'text-ok' : 'text-warn'}>{check.status}</span><span>{check.reason}{check.evidence ? ` — ${check.evidence}` : ''}</span></li>)}</ul>}
+                  <input aria-label={`Select candidate ${index + 1}`} type="checkbox" checked={checked} onChange={() => toggleSelected(clip.id)} disabled={!clip.id || !editable || isBusy || savingEdits || hasUnsavedEdits} className="mt-1 accent-[var(--brass)]" />
+                  <div className="min-w-0 flex-1 space-y-3">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="eyebrow">{String(index + 1).padStart(2, '0')} · {clip.duration}s · {clip.pillar}</span>
+                      {editable && <button type="button" onClick={() => removeCandidate(key)} aria-label={`Remove candidate ${index + 1}`} disabled={savingEdits || isBusy} className="text-muted hover:text-red-300 disabled:opacity-50"><Trash2 size={15} /></button>}
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <label className="text-xs text-muted">Start (seconds)<input aria-label={`Candidate ${index + 1} start time in seconds`} type="number" min="0" max={draft.video_duration} step="0.1" value={clip.start} disabled={!editable || isBusy || savingEdits} onChange={(e) => Number.isFinite(e.target.valueAsNumber) && updateCandidate(key, { start: e.target.valueAsNumber, duration: Math.max(0, Number(clip.end) - e.target.valueAsNumber) })} className="input mt-1 w-full" /></label>
+                      <label className="text-xs text-muted">End (seconds)<input aria-label={`Candidate ${index + 1} end time in seconds`} type="number" min="0" max={draft.video_duration} step="0.1" value={clip.end} disabled={!editable || isBusy || savingEdits} onChange={(e) => Number.isFinite(e.target.valueAsNumber) && updateCandidate(key, { end: e.target.valueAsNumber, duration: Math.max(0, e.target.valueAsNumber - Number(clip.start)) })} className="input mt-1 w-full" /></label>
+                    </div>
+                    <label className="block text-xs text-muted">Title<input aria-label={`Candidate ${index + 1} title`} value={clip.title} disabled={!editable || isBusy || savingEdits} onChange={(e) => updateCandidate(key, { title: e.target.value })} maxLength={160} className="input mt-1 w-full" /></label>
+                    <label className="block text-xs text-muted">Hook<input aria-label={`Candidate ${index + 1} hook`} value={clip.hook} disabled={!editable || isBusy || savingEdits} onChange={(e) => updateCandidate(key, { hook: e.target.value })} maxLength={300} className="input mt-1 w-full" /></label>
+                    <label className="block text-xs text-muted">Caption<textarea aria-label={`Candidate ${index + 1} caption`} value={clip.caption} disabled={!editable || isBusy || savingEdits} onChange={(e) => updateCandidate(key, { caption: e.target.value })} maxLength={2000} rows={3} className="input mt-1 w-full resize-y" /></label>
+                    {clip.evidence && <blockquote className="text-xs text-ink2 border-l-2 border-rule pl-3">Source: {clip.evidence}</blockquote>}
+                    {clip.checks?.length > 0 && <ul className="space-y-1">{clip.checks.map((check, checkIndex) => <li key={`${check.rule_id}-${checkIndex}`} className="text-xs text-muted flex gap-2"><span className={check.status === 'pass' ? 'text-ok' : 'text-warn'}>{check.status}</span><span>{check.reason}{check.evidence ? ` — ${check.evidence}` : ''}</span></li>)}</ul>}
                   </div>
                 </div>
               </article>;
@@ -251,7 +360,7 @@ export default function CustomClips() {
             {draft.chat_history?.slice(-6).map((item, index) => <p key={`${item.role}-${index}`} className="text-xs text-muted mb-2"><strong className="text-ink2">{item.role === 'user' ? 'You' : 'AI'}:</strong> {item.content}</p>)}
             <form onSubmit={sendMessage} className="flex flex-col sm:flex-row gap-2">
               <input value={chatMessage} onChange={(e) => setChatMessage(e.target.value)} maxLength={4000} placeholder="Ask to adjust a hook, explain a rule, or revise a candidate…" className="input flex-1" />
-              <button type="submit" disabled={busyChat || !chatMessage.trim()} className="btn-quiet px-4 py-2 text-sm disabled:opacity-50">{busyChat ? <Loader2 size={15} className="animate-spin" /> : null}Discuss</button>
+              <button type="submit" disabled={busyChat || !chatMessage.trim() || hasUnsavedEdits || savingEdits} className="btn-quiet px-4 py-2 text-sm disabled:opacity-50">{busyChat ? <Loader2 size={15} className="animate-spin" /> : null}Discuss</button>
             </form>
           </div>}
 

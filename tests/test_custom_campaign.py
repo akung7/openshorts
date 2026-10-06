@@ -272,3 +272,123 @@ def test_campaign_analysis_uses_configured_llm_and_runtime_guide(monkeypatch):
     assert "Campaign-specific rule" in captured["prompt"]
     assert "Grounded quote" in captured["prompt"]
     assert captured["schema"].__name__ == "CampaignResponse"
+
+
+def test_campaign_analysis_can_override_the_configured_compatible_model(monkeypatch):
+    import sys
+    import types
+    from custom_campaign import generate_campaign_analysis
+
+    captured = {}
+    response = {"summary": "Selected model draft", "campaign_rules": [], "clips": []}
+    backend = types.SimpleNamespace(
+        active=lambda: False,
+        model_name=lambda: "server-default",
+        base_url=lambda: "https://llm.test/v1",
+        generate_json=lambda prompt, schema, model: captured.update(model=model) or (response, None),
+    )
+    monkeypatch.setitem(sys.modules, "llm_backend", backend)
+    monkeypatch.setitem(sys.modules, "pydantic", types.SimpleNamespace(
+        BaseModel=object,
+        Field=lambda default_factory=None, **kwargs: default_factory() if default_factory else kwargs.get("default"),
+    ))
+
+    result = generate_campaign_analysis(
+        api_key=None,
+        transcript={"language": "en", "segments": []},
+        video_duration=60,
+        guideline_text="Campaign-specific rule",
+        provider="openai-compatible",
+        model="selected-model",
+    )
+
+    assert result == response
+    assert captured["model"] == "selected-model"
+
+
+def test_campaign_chat_reuses_the_draft_provider_and_model(monkeypatch):
+    import sys
+    import types
+    from custom_campaign import generate_campaign_chat
+
+    captured = {}
+    response = {"reply": "Updated", "summary": "Revised", "campaign_rules": [], "clips": []}
+    backend = types.SimpleNamespace(
+        active=lambda: False,
+        model_name=lambda: "server-default",
+        base_url=lambda: "https://llm.test/v1",
+        generate_json=lambda prompt, schema, model: captured.update(model=model) or (response, None),
+    )
+    monkeypatch.setitem(sys.modules, "llm_backend", backend)
+    monkeypatch.setitem(sys.modules, "pydantic", types.SimpleNamespace(
+        BaseModel=object,
+        Field=lambda default_factory=None, **kwargs: default_factory() if default_factory else kwargs.get("default"),
+    ))
+
+    result = generate_campaign_chat(
+        api_key=None,
+        draft={"summary": "Draft", "clips": [], "campaign_rules": []},
+        message="Make the hook shorter",
+        guideline_text="Keep it concise",
+        provider="openai-compatible",
+        model="draft-selected-model",
+    )
+
+    assert result == response
+    assert captured["model"] == "draft-selected-model"
+
+
+def test_edit_draft_clips_updates_manual_fields_and_preserves_candidate_id():
+    from custom_campaign import edit_draft_clips
+
+    draft = {
+        "id": "draft-1", "revision": 2, "status": "draft", "video_duration": 100,
+        "clips": [{
+            "id": "clip-1", "start": 10, "end": 30, "duration": 20,
+            "title": "Old title", "hook": "Old hook", "caption": "Old caption",
+            "pillar": "story", "evidence": "[12-15s] exact quote",
+            "checks": [{"rule_id": "source-evidence", "status": "pass", "reason": "Supported", "evidence": "[12-15s] exact quote"}],
+        }],
+    }
+
+    edited = edit_draft_clips(draft, revision=2, clips=[{
+        "id": "clip-1", "start": 11, "end": 31, "title": "New title",
+        "hook": "New hook", "caption": "New caption", "pillar": "story",
+    }])
+
+    clip = edited["clips"][0]
+    assert edited["revision"] == 3
+    assert clip["id"] == "clip-1"
+    assert (clip["start"], clip["end"], clip["duration"]) == (11.0, 31.0, 20.0)
+    assert (clip["title"], clip["hook"], clip["caption"]) == ("New title", "New hook", "New caption")
+    assert clip["checks"][0]["status"] == "pass"
+    assert any(check["rule_id"] == "user-copy-review" and check["status"] == "review" for check in clip["checks"])
+
+
+def test_edit_draft_clips_adds_manual_candidate_and_marks_evidence_for_review():
+    from custom_campaign import edit_draft_clips
+
+    draft = {"id": "draft-1", "revision": 1, "status": "draft", "video_duration": 90, "clips": []}
+
+    edited = edit_draft_clips(draft, revision=1, clips=[{
+        "start": 5, "end": 20, "title": "Manual", "hook": "Hook", "caption": "Caption",
+    }])
+
+    clip = edited["clips"][0]
+    assert clip["id"]
+    assert clip["pillar"] == "Manual"
+    assert clip["evidence"] == ""
+    assert any(check["rule_id"] == "source-evidence" and check["status"] == "review" for check in clip["checks"])
+
+
+def test_edit_draft_clips_rejects_invalid_or_stale_edits():
+    import pytest
+    from custom_campaign import DraftValidationError, StaleDraftError, edit_draft_clips
+
+    draft = {"id": "draft-1", "revision": 1, "status": "draft", "video_duration": 30, "clips": []}
+    clip = {"start": 1, "end": 10, "title": "Manual", "hook": "", "caption": ""}
+
+    with pytest.raises(StaleDraftError):
+        edit_draft_clips(draft, revision=0, clips=[clip])
+    with pytest.raises(DraftValidationError):
+        edit_draft_clips(draft, revision=1, clips=[{**clip, "end": 31}])

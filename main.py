@@ -2419,6 +2419,8 @@ if __name__ == '__main__':
                 transcript=transcript,
                 video_duration=duration,
                 guideline_text=guideline_text,
+                provider=os.environ.get("CAMPAIGN_AI_PROVIDER") or None,
+                model=os.environ.get("CAMPAIGN_AI_MODEL") or None,
             )
             draft = create_campaign_draft(
                 draft_id=args.draft_id,
@@ -2427,6 +2429,13 @@ if __name__ == '__main__':
                 guideline_text=guideline_text,
                 source_video=os.path.basename(input_video),
                 response=response,
+            )
+            draft["ai_provider"] = os.environ.get("CAMPAIGN_AI_PROVIDER", "") or (
+                "openai-compatible" if llm_backend.active() else "gemini"
+            )
+            draft["ai_model"] = os.environ.get("CAMPAIGN_AI_MODEL", "") or (
+                llm_backend.model_name() if draft["ai_provider"] == "openai-compatible"
+                else os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-lite")
             )
             draft_path = os.path.join(output_dir, "custom_draft.json")
             with open(draft_path, "w", encoding="utf-8") as draft_file:

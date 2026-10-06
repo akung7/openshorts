@@ -28,7 +28,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from starlette.background import BackgroundTask
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from s3_uploader import upload_job_artifacts, list_all_clips, upload_actor_to_s3, list_actor_gallery, upload_video_to_gallery, list_video_gallery
 import recut
 import layout_ranges
@@ -36,9 +36,11 @@ import watermarked
 import media_auth
 from custom_campaign import (
     DraftValidationError,
+    StaleDraftError,
     approve_draft,
     assert_approved_draft,
     build_approved_render_plan,
+    edit_draft_clips,
     extract_guideline_text,
     fetch_guideline_text,
     generate_campaign_chat,
@@ -2489,6 +2491,43 @@ class CustomChatRequest(BaseModel):
     revision: int
 
 
+class CustomClipEditRequest(BaseModel):
+    id: Optional[str] = None
+    start: float
+    end: float
+    title: str = Field(default="", max_length=160)
+    hook: str = Field(default="", max_length=300)
+    caption: str = Field(default="", max_length=2000)
+    pillar: str = Field(default="Manual", max_length=80)
+
+
+class CustomDraftClipsRequest(BaseModel):
+    revision: int
+    clips: List[CustomClipEditRequest] = Field(max_length=50)
+
+
+@app.put("/api/custom/drafts/{draft_id}/clips")
+async def edit_custom_draft_clips(draft_id: str, body: CustomDraftClipsRequest, request: Request):
+    """Save the user's edited timeline and copy for this exact draft revision."""
+    canonical_id = str(uuid.UUID(_custom_draft_dir(draft_id).split(os.sep)[-1]))
+    lock = custom_draft_locks.setdefault(canonical_id, asyncio.Lock())
+    async with lock:
+        directory = await _assert_custom_draft_owner(request, canonical_id)
+        directory, draft = _read_custom_draft(canonical_id)
+        try:
+            updated = edit_draft_clips(
+                draft,
+                revision=body.revision,
+                clips=[clip.dict() for clip in body.clips],
+            )
+        except StaleDraftError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        except DraftValidationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        _save_custom_draft(directory, updated)
+        return updated
+
+
 class CustomApprovalRequest(BaseModel):
     revision: int
     selected_clip_ids: List[str]
@@ -2894,11 +2933,27 @@ async def health_ready():
 
 @app.get("/api/config")
 async def get_config():
+    campaign_ai_models = [{
+        "id": "gemini",
+        "provider": "Gemini",
+        "model": os.environ.get("GEMINI_MODEL") or "gemini-3.1-flash-lite",
+    }]
+    if not BILLING_ENABLED and llm_backend.base_url():
+        campaign_ai_models.append({
+            "id": "openai-compatible",
+            "provider": "OpenAI-compatible",
+            "model": llm_backend.model_name(),
+        })
+    default_campaign_ai_provider = (
+        "openai-compatible" if not BILLING_ENABLED and llm_backend.active() else "gemini"
+    )
     return {
         "youtubeUrlEnabled": not DISABLE_YOUTUBE_URL,
         "billingEnabled": BILLING_ENABLED,
         "googleAuthEnabled": bool(BILLING_ENABLED and cloud.settings.google_auth_enabled),
         "jobRetentionSeconds": JOB_RETENTION_SECONDS,
+        "campaignAiModels": campaign_ai_models,
+        "defaultCampaignAiProvider": default_campaign_ai_provider,
         # Self-host only: tells the dashboard the Gemini key is optional
         # because the moment picker runs on an OpenAI-compatible server.
         "localLlm": None if BILLING_ENABLED else llm_backend.describe(),
@@ -3180,11 +3235,23 @@ async def custom_analyze_endpoint(
     guideline_url: Optional[str] = Form(None),
     guideline_text: Optional[str] = Form(None),
     acknowledged: Optional[str] = Form(None),
+    ai_provider: Optional[str] = Form(None),
 ):
     """Create a campaign-analysis job. This endpoint never renders clips."""
     api_key = await resolve_gemini(request)
-    if not api_key and not (llm_backend.active() and not BILLING_ENABLED):
-        raise gemini_missing_error()
+    selected_provider = (ai_provider or "").strip() or (
+        "openai-compatible" if not BILLING_ENABLED and llm_backend.active() else "gemini"
+    )
+    if selected_provider == "openai-compatible":
+        if BILLING_ENABLED or not llm_backend.base_url():
+            raise HTTPException(status_code=400, detail="OpenAI-compatible AI is not configured on this server.")
+        selected_model = llm_backend.model_name()
+    elif selected_provider == "gemini":
+        if not api_key:
+            raise gemini_missing_error()
+        selected_model = os.environ.get("GEMINI_MODEL") or "gemini-3.1-flash-lite"
+    else:
+        raise HTTPException(status_code=400, detail="Unsupported campaign AI provider.")
     if str(acknowledged).lower() not in ("1", "true", "yes"):
         raise HTTPException(status_code=400, detail="Confirm that you own the source or have rights to use it.")
     if bool(file) == bool(url):
@@ -3247,6 +3314,8 @@ async def custom_analyze_endpoint(
         )
         env = child_env()
         env.setdefault("PYTHONIOENCODING", "utf-8")
+        env["CAMPAIGN_AI_PROVIDER"] = selected_provider
+        env["CAMPAIGN_AI_MODEL"] = selected_model
         if api_key:
             env["GEMINI_API_KEY"] = api_key
         else:
@@ -3420,6 +3489,8 @@ async def discuss_custom_draft(draft_id: str, body: CustomChatRequest, request: 
                 draft=draft,
                 message=message,
                 guideline_text=draft.get("guideline_text", ""),
+                provider=draft.get("ai_provider"),
+                model=draft.get("ai_model"),
             ),
         )
         normalized = normalize_campaign_response(

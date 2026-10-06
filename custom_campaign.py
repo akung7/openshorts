@@ -220,8 +220,22 @@ USER MESSAGE (untrusted request data):
 """
 
 
+def _uses_compatible_provider(provider: str | None, llm_backend) -> bool:
+    """Resolve an explicit campaign provider while preserving legacy defaults."""
+    if provider is None:
+        return llm_backend.active()
+    if provider == "openai-compatible":
+        if not llm_backend.base_url():
+            raise DraftValidationError("The OpenAI-compatible provider is not configured")
+        return True
+    if provider == "gemini":
+        return False
+    raise DraftValidationError("Unsupported campaign AI provider")
+
+
 def generate_campaign_chat(
-    *, api_key: str | None, draft: dict[str, Any], message: str, guideline_text: str
+    *, api_key: str | None, draft: dict[str, Any], message: str, guideline_text: str,
+    provider: str | None = None, model: str | None = None,
 ) -> dict[str, Any]:
     """Ask the configured local LLM or Gemini to discuss and revise a draft."""
     from typing import Literal
@@ -260,9 +274,9 @@ def generate_campaign_chat(
     prompt = build_campaign_chat_prompt(draft, message, guideline_text)
     import llm_backend
 
-    if llm_backend.active():
+    if _uses_compatible_provider(provider, llm_backend):
         parsed, _cost = llm_backend.generate_json(
-            prompt, ChatResponse, model=llm_backend.model_name()
+            prompt, ChatResponse, model=model or llm_backend.model_name()
         )
         return parsed if isinstance(parsed, dict) else parsed.model_dump()
     if not api_key:
@@ -270,7 +284,7 @@ def generate_campaign_chat(
     from google import genai
     from google.genai import types as genai_types
 
-    model = os.environ.get("GEMINI_MODEL") or "gemini-3.1-flash-lite"
+    model = model or os.environ.get("GEMINI_MODEL") or "gemini-3.1-flash-lite"
     response = genai.Client(api_key=api_key).models.generate_content(
         model=model,
         contents=prompt,
@@ -293,6 +307,8 @@ def generate_campaign_analysis(
     transcript: dict[str, Any],
     video_duration: float,
     guideline_text: str,
+    provider: str | None = None,
+    model: str | None = None,
 ) -> dict[str, Any]:
     """Ask the configured AI for a source-grounded, campaign-specific draft."""
     from typing import Literal
@@ -329,9 +345,9 @@ def generate_campaign_analysis(
     prompt = build_campaign_prompt(transcript, video_duration, guideline_text)
     import llm_backend
 
-    if llm_backend.active():
+    if _uses_compatible_provider(provider, llm_backend):
         parsed, _cost = llm_backend.generate_json(
-            prompt, CampaignResponse, model=llm_backend.model_name()
+            prompt, CampaignResponse, model=model or llm_backend.model_name()
         )
         return parsed if isinstance(parsed, dict) else parsed.model_dump()
     if not api_key:
@@ -340,7 +356,7 @@ def generate_campaign_analysis(
     from google import genai
     from google.genai import types as genai_types
 
-    model = os.environ.get("GEMINI_MODEL") or "gemini-3.1-flash-lite"
+    model = model or os.environ.get("GEMINI_MODEL") or "gemini-3.1-flash-lite"
     response = genai.Client(api_key=api_key).models.generate_content(
         model=model,
         contents=prompt,
@@ -559,6 +575,120 @@ def build_approved_render_plan(draft: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(transcript, dict):
         transcript = {"language": "none", "segments": []}
     return {"clips": rendered_clips, "transcript": deepcopy(transcript)}
+
+
+def edit_draft_clips(
+    draft: dict[str, Any], *, revision: int, clips: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Validate and persist a user's editable clip proposal set."""
+    if not isinstance(draft, dict) or draft.get("status") != "draft" or draft.get("render_job_id"):
+        raise DraftValidationError("This draft can no longer be edited")
+    try:
+        current_revision = int(draft.get("revision", -1))
+        requested_revision = int(revision)
+        source_duration = float(draft.get("video_duration"))
+    except (TypeError, ValueError):
+        raise DraftValidationError("Draft revision or source duration is invalid") from None
+    if requested_revision != current_revision:
+        raise StaleDraftError("The draft changed; refresh it before saving edits")
+    if not math.isfinite(source_duration) or source_duration <= 0:
+        raise DraftValidationError("Draft source duration is invalid")
+    if not isinstance(clips, list) or len(clips) > 50:
+        raise DraftValidationError("A draft can contain at most 50 clip candidates")
+
+    existing = {
+        str(item.get("id")): item
+        for item in draft.get("clips", [])
+        if isinstance(item, dict) and item.get("id") is not None
+    }
+    seen_ids: set[str] = set()
+    normalized: list[dict[str, Any]] = []
+    for index, item in enumerate(clips):
+        if not isinstance(item, dict):
+            raise DraftValidationError("Clip edits must be objects")
+        try:
+            start, end = float(item["start"]), float(item["end"])
+        except (KeyError, TypeError, ValueError):
+            raise DraftValidationError("Clip timestamps are invalid") from None
+        if not math.isfinite(start) or not math.isfinite(end) or start < 0 or end <= start or end > source_duration:
+            raise DraftValidationError("Clip timestamps are outside the source video")
+
+        clip_id = str(item.get("id") or uuid.uuid4())
+        if item.get("id") and clip_id not in existing:
+            raise DraftValidationError("Clip edit references a candidate outside this draft")
+        if clip_id in seen_ids:
+            raise DraftValidationError("Clip edits contain duplicate candidates")
+        seen_ids.add(clip_id)
+
+        def text_field(name: str, default: str, limit: int) -> str:
+            value = item.get(name, default)
+            if not isinstance(value, str) or len(value) > limit:
+                raise DraftValidationError(f"Clip {name} is invalid or too long")
+            return value.strip()
+
+        previous = existing.get(clip_id, {})
+        duration = round(end - start, 3)
+        evidence = str(previous.get("evidence") or "")
+        checks = deepcopy(previous.get("checks") or [])
+        evidence_valid = _evidence_matches_transcript(
+            evidence, draft.get("transcript"), clip_start=start, clip_end=end
+        )
+        refreshed_checks = []
+        source_check_found = False
+        for check in checks:
+            if not isinstance(check, dict):
+                continue
+            check = deepcopy(check)
+            if check.get("rule_id") == "duration":
+                continue
+            if check.get("rule_id") == "source-evidence":
+                source_check_found = True
+                if not evidence_valid:
+                    check["status"] = "review"
+                    check["reason"] = "Clip timing changed or evidence is unavailable; verify against the source."
+            elif check.get("status") == "pass" and not _evidence_matches_transcript(
+                check.get("evidence", ""), draft.get("transcript"), clip_start=start, clip_end=end
+            ):
+                check["status"] = "review"
+                check["reason"] = "Clip timing changed; verify this rule against the source."
+            refreshed_checks.append(check)
+        if not source_check_found:
+            refreshed_checks.append({
+                "rule_id": "source-evidence",
+                "status": "pass" if evidence_valid else "review",
+                "reason": "Exact transcript evidence is inside the selected range." if evidence_valid else "Verify the selected source range; no verified quote is attached.",
+                "evidence": evidence,
+            })
+        copy_changed = any(
+            text_field(name, str(previous.get(name) or ""), limit) != str(previous.get(name) or "")
+            for name, limit in (("title", 160), ("hook", 300), ("caption", 2_000))
+        )
+        if copy_changed and not any(check.get("rule_id") == "user-copy-review" for check in refreshed_checks):
+            refreshed_checks.append({
+                "rule_id": "user-copy-review", "status": "review",
+                "reason": "Copy was edited; re-check claims and campaign compliance before rendering.",
+                "evidence": "",
+            })
+        if duration < 15 or duration > 45:
+            refreshed_checks.append({
+                "rule_id": "duration", "status": "warning",
+                "reason": "Outside the campaign's 15–45 second target; review the duration exception.",
+                "evidence": f"Proposed duration: {duration:g}s",
+            })
+
+        normalized.append({
+            "id": clip_id,
+            "start": round(start, 3),
+            "end": round(end, 3),
+            "duration": duration,
+            "title": text_field("title", f"Candidate {index + 1}", 160),
+            "hook": text_field("hook", "", 300),
+            "caption": text_field("caption", "", 2_000),
+            "pillar": text_field("pillar", "Manual", 80),
+            "evidence": evidence if evidence_valid else "",
+            "checks": refreshed_checks,
+        })
+    return revise_draft(draft, {"clips": normalized})
 
 
 def revise_draft(draft: dict[str, Any], changes: dict[str, Any]) -> dict[str, Any]:
