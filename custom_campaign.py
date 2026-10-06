@@ -285,7 +285,10 @@ def generate_campaign_chat(
     from google.genai import types as genai_types
 
     model = model or os.environ.get("GEMINI_MODEL") or "gemini-3.1-flash-lite"
-    response = genai.Client(api_key=api_key).models.generate_content(
+    # Hold a reference: the SDK's Client.__del__ closes the HTTP client, and an
+    # inline chained temporary can be finalized mid-call ("client has been closed").
+    client = genai.Client(api_key=api_key)
+    response = client.models.generate_content(
         model=model,
         contents=prompt,
         config=genai_types.GenerateContentConfig(
@@ -357,7 +360,10 @@ def generate_campaign_analysis(
     from google.genai import types as genai_types
 
     model = model or os.environ.get("GEMINI_MODEL") or "gemini-3.1-flash-lite"
-    response = genai.Client(api_key=api_key).models.generate_content(
+    # Hold a reference: the SDK's Client.__del__ closes the HTTP client, and an
+    # inline chained temporary can be finalized mid-call ("client has been closed").
+    client = genai.Client(api_key=api_key)
+    response = client.models.generate_content(
         model=model,
         contents=prompt,
         config=genai_types.GenerateContentConfig(
