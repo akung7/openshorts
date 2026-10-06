@@ -3264,10 +3264,11 @@ async def _download_asset_from_url(url: str, assets_dir: str, *, max_bytes: int)
     pages are not file URLs — source video belongs in the analysis upload.
     """
     import httpx
-    from urllib.parse import unquote, urlparse
+    from urllib.parse import unquote, urljoin, urlparse
     from security_utils import assert_public_url
+    from custom_campaign import normalize_drive_url
 
-    current = assert_public_url(url.strip())
+    current = assert_public_url(normalize_drive_url(url))
     stored = None
     async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0), follow_redirects=False, trust_env=False) as client:
         target = current
@@ -3279,11 +3280,31 @@ async def _download_asset_from_url(url: str, assets_dir: str, *, max_bytes: int)
                 await response.aclose()
                 if not location:
                     raise HTTPException(status_code=422, detail="Asset URL redirect has no destination")
-                from urllib.parse import urljoin
                 target = urljoin(target, location)
                 assert_public_url(target)
                 continue
-            response.raise_for_status()
+            if response.status_code >= 400:
+                hint = ""
+                if "drive" in urlparse(target).netloc and response.status_code in (401, 403, 404):
+                    hint = (" Google Drive says this file is not shared publicly — set its "
+                            "sharing to 'Anyone with the link', or upload the file directly.")
+                await response.aclose()
+                raise HTTPException(status_code=422, detail=f"Asset URL returned HTTP {response.status_code}.{hint}")
+            content_type = response.headers.get("content-type", "").split(";", 1)[0].lower()
+            if content_type in {"text/html", "application/xhtml+xml"}:
+                # Drive's virus-scan interstitial answers with a confirm link.
+                head = await response.aread()
+                await response.aclose()
+                html = head.decode("utf-8", errors="replace")
+                if "drive" in urlparse(target).netloc and "confirm=t" in html:
+                    match = re.search(
+                        r"https://drive\.usercontent\.google\.com/download\?[^\s<>]*confirm=t[^\s<>]*", html
+                    )
+                    if match:
+                        target = match.group(0).replace("&amp;", "&")
+                        assert_public_url(target)
+                        continue
+                raise HTTPException(status_code=422, detail="That link returned a webpage, not a file — use a direct file URL or upload the file.")
             declared = response.headers.get("content-length")
             if declared and int(declared) > max_bytes:
                 await response.aclose()
@@ -3458,6 +3479,48 @@ async def parse_campaign_guideline_endpoint(campaign_id: str, body: CampaignPars
         campaign["guideline_text"] = guideline_text[:campaigns.MAX_GUIDELINE_CHARS]
         if (body.guideline_url or "").strip():
             campaign["guideline_url"] = body.guideline_url.strip()
+    except DraftValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    campaigns.save_campaign(directory, campaign)
+    return campaigns.public_view(campaign)
+
+
+@app.post("/api/campaigns/{campaign_id}/parse-guideline-file")
+async def parse_campaign_guideline_file(campaign_id: str, request: Request, file: UploadFile = File(...)):
+    """Extract rules from an uploaded guideline PDF/TXT/Markdown file."""
+    directory = await _assert_campaign_owner(request, campaign_id)
+    _, campaign = _load_campaign_or_404(campaign_id)
+    guide_bytes = await file.read(5 * 1024 * 1024 + 1)
+    if len(guide_bytes) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Guideline file exceeds the 5 MB limit")
+    loop = asyncio.get_event_loop()
+    try:
+        guideline_text = await loop.run_in_executor(
+            None, extract_guideline_text, file.filename or "guideline.pdf", guide_bytes
+        )
+    except DraftValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Could not read the guideline file: {exc}") from None
+    if not str(guideline_text or "").strip():
+        raise HTTPException(status_code=422, detail="The guideline file contains no readable text.")
+    selected_provider = (
+        "openai-compatible" if not BILLING_ENABLED and llm_backend.active() else "gemini"
+    )
+    key = await resolve_gemini(request) if selected_provider == "gemini" else None
+    try:
+        parsed = await loop.run_in_executor(
+            None,
+            functools.partial(
+                parse_campaign_guideline,
+                str(guideline_text),
+                api_key=key,
+                model=os.environ.get("GEMINI_MODEL"),
+                provider=selected_provider,
+            ),
+        )
+        campaigns.set_rules(campaign, parsed.get("rules", []))
+        campaign["guideline_text"] = str(guideline_text)[:campaigns.MAX_GUIDELINE_CHARS]
     except DraftValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from None
     campaigns.save_campaign(directory, campaign)

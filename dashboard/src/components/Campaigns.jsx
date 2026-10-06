@@ -65,6 +65,7 @@ export default function Campaigns({ onOpenDraft }) {
   const [newForm, setNewForm] = useState({ name: '', platform: '', reward: '', deadline: '', brief_link: '', guideline_text: '', guideline_url: '' });
   // Guideline panel: paste text or pull from a public URL.
   const [guideMode, setGuideMode] = useState('text');
+  const [guideFile, setGuideFile] = useState(null);
   const [guidelineDraft, setGuidelineDraft] = useState('');
   const [guideUrl, setGuideUrl] = useState('');
   // Asset panel: upload a file or register a public URL.
@@ -174,6 +175,27 @@ export default function Campaigns({ onOpenDraft }) {
       applyUpdated(updated, count ? `Extracted ${count} rule(s) from the guideline.` : 'The AI returned no rules; refine the guideline text.');
     } catch (e) {
       setError(e?.detail || e?.message || 'Could not parse the guideline.');
+    } finally {
+      setBusy('');
+    }
+  };
+
+  const parseGuidelineFile = async () => {
+    if (!selected || !guideFile) {
+      setError('Choose a guideline file first.');
+      return;
+    }
+    setBusy('parse');
+    setError('');
+    try {
+      const form = new FormData();
+      form.append('file', guideFile);
+      const updated = await sendForm(`/api/campaigns/${encodeURIComponent(selected.id)}/parse-guideline-file`, form);
+      const count = (updated.rules || []).length;
+      applyUpdated(updated, count ? `Extracted ${count} rule(s) from the file.` : 'The AI returned no rules; try a clearer guideline file.');
+      setGuideFile(null);
+    } catch (e) {
+      setError(e?.detail || e?.message || 'Could not parse the guideline file.');
     } finally {
       setBusy('');
     }
@@ -372,6 +394,7 @@ export default function Campaigns({ onOpenDraft }) {
               <Tabs
                 tabs={[
                   { id: 'text', label: 'Paste text', icon: FileText },
+                  { id: 'file', label: 'Upload file', icon: UploadCloud },
                   { id: 'url', label: 'Public link', icon: Link2 },
                 ]}
                 active={guideMode}
@@ -383,6 +406,15 @@ export default function Campaigns({ onOpenDraft }) {
                   <div className="flex flex-wrap gap-2 mt-3">
                     <button type="button" onClick={saveMeta} disabled={busy === 'save'} className="btn-quiet px-3 py-2 text-xs disabled:opacity-50"><Save size={13} />Save guideline</button>
                     <button type="button" onClick={parseGuideline} disabled={busy === 'parse' || !guidelineDraft.trim()} className="btn-primary px-3 py-2 text-xs disabled:opacity-50">{busy === 'parse' ? <Loader2 size={13} className="animate-spin" /> : <Wand2 size={13} />}Extract rules with AI</button>
+                  </div>
+                </>
+              )}
+              {guideMode === 'file' && (
+                <>
+                  <input type="file" accept=".pdf,.txt,.md,.markdown,application/pdf,text/plain,text/markdown" onChange={(e) => setGuideFile(e.target.files?.[0] || null)} className="block w-full text-sm text-muted file:mr-3 file:rounded-input file:border-0 file:bg-paper3 file:px-3 file:py-2 file:text-ink" />
+                  <p className="text-xs text-muted mt-2">PDF, plain text and Markdown are supported — the most reliable way in, no sharing permissions needed.</p>
+                  <div className="flex flex-wrap gap-2 mt-3">
+                    <button type="button" onClick={parseGuidelineFile} disabled={busy === 'parse' || !guideFile} className="btn-primary px-3 py-2 text-xs disabled:opacity-50">{busy === 'parse' ? <Loader2 size={13} className="animate-spin" /> : <Wand2 size={13} />}Extract rules from file</button>
                   </div>
                 </>
               )}

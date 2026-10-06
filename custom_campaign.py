@@ -85,11 +85,29 @@ def extract_guideline_text(filename: str, content: bytes) -> str:
     return text
 
 
+_DRIVE_FILE_RE = re.compile(r"https?://(?:www\.)?drive\.google\.com/file/d/([A-Za-z0-9_-]+)")
+
+
+def normalize_drive_url(url: str) -> str:
+    """Rewrite a Drive /file/d/<id>/view link into its direct-download form."""
+    match = _DRIVE_FILE_RE.match(url.strip())
+    if match:
+        return f"https://drive.google.com/uc?export=download&id={match.group(1)}"
+    return url.strip()
+
+
+def _drive_sharing_hint(url: str, status: int) -> str:
+    if "drive" in urlparse(url).netloc and status in (401, 403, 404):
+        return (" Google Drive says this file is not shared publicly — set its "
+                "sharing to 'Anyone with the link', or upload the file directly.")
+    return ""
+
+
 def fetch_guideline_text(url: str) -> str:
     """Fetch a public text/PDF guide while validating every redirect target."""
     import httpx
 
-    current = assert_public_url(url.strip())
+    current = assert_public_url(normalize_drive_url(url))
     timeout = httpx.Timeout(15.0, connect=5.0)
     headers = {"User-Agent": "OpenShorts-CampaignGuideline/1.0"}
 
@@ -103,7 +121,11 @@ def fetch_guideline_text(url: str) -> str:
                         raise DraftValidationError("Guideline URL redirect has no destination")
                     current = urljoin(current, location)
                     continue
-                response.raise_for_status()
+                if response.status_code >= 400:
+                    raise DraftValidationError(
+                        f"Guideline URL returned HTTP {response.status_code}."
+                        + _drive_sharing_hint(current, response.status_code)
+                    )
                 declared_size = response.headers.get("content-length")
                 if declared_size and int(declared_size) > MAX_GUIDELINE_BYTES:
                     raise DraftValidationError("Guideline URL exceeds the 5 MB limit")
@@ -123,6 +145,12 @@ def fetch_guideline_text(url: str) -> str:
                     return extract_guideline_text(filename if PurePath(filename).suffix else "guideline.txt", body)
                 if content_type in {"text/html", "application/xhtml+xml"}:
                     html = body.decode("utf-8", errors="replace")
+                    if "drive" in urlparse(current).netloc:
+                        confirm = re.search(
+                                r'https://drive\.usercontent\.google\.com/download\?[^\s<>]*confirm=t[^\s<>]*', html)
+                        if confirm:
+                            current = confirm.group(0).replace("&amp;", "&")
+                            continue
                     parser = _HTMLTextExtractor()
                     parser.feed(html)
                     text = "\n".join(parser.parts)

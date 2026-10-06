@@ -10,6 +10,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 import app as app_module
+import custom_campaign
 import campaigns
 
 
@@ -335,3 +336,59 @@ class CampaignUrlIngestTests(unittest.TestCase):
         _, campaign = campaigns.load_campaign(cid)
         self.assertEqual(campaign["assets"], [])
         self.assertFalse(os.path.exists(os.path.join(campaigns.campaign_dir(cid), "assets", "x.bin")))
+
+
+class GuidelineIngestExtraTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        patcher = patch.object(campaigns, "CAMPAIGNS_DIR", str(Path(self.tmp.name) / "campaigns"))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.client = TestClient(app_module.app, raise_server_exceptions=False)
+
+    def test_normalize_drive_url(self):
+        self.assertEqual(
+            custom_campaign.normalize_drive_url("https://drive.google.com/file/d/1AbC/view?usp=drive_link"),
+            "https://drive.google.com/uc?export=download&id=1AbC",
+        )
+        self.assertEqual(
+            custom_campaign.normalize_drive_url("https://example.com/plain.pdf"),
+            "https://example.com/plain.pdf",
+        )
+
+    def test_parse_guideline_file_uploads_and_extracts(self):
+        created = self.client.post("/api/campaigns", json={"name": "File brief"}).json()
+        cid = created["id"]
+
+        def fake_extract(filename, content):
+            self.assertTrue(filename.endswith(".pdf"))
+            return "Mandatory: 30-60 seconds."
+
+        async def fake_key(_request):
+            return "key"
+
+        def fake_parse(text, *, api_key=None, model=None, provider="gemini"):
+            return {"rules": [{"label": "Duration 30-60s", "description": ""}]}
+
+        with patch.object(app_module, "extract_guideline_text", fake_extract), \
+             patch.object(app_module, "resolve_gemini", fake_key), \
+             patch.object(app_module, "parse_campaign_guideline", fake_parse):
+            response = self.client.post(
+                f"/api/campaigns/{cid}/parse-guideline-file",
+                files={"file": ("brief.pdf", b"%PDF-fake", "application/pdf")},
+            )
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(body["rules"][0]["label"], "Duration 30-60s")
+        self.assertIn("30-60", body["guideline_text"])
+
+    def test_parse_guideline_file_rejects_empty_extract(self):
+        created = self.client.post("/api/campaigns", json={"name": "Empty"}).json()
+        cid = created["id"]
+        with patch.object(app_module, "extract_guideline_text", lambda f, c: ""):
+            response = self.client.post(
+                f"/api/campaigns/{cid}/parse-guideline-file",
+                files={"file": ("blank.pdf", b"%PDF-", "application/pdf")},
+            )
+        self.assertEqual(response.status_code, 422)
