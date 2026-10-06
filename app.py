@@ -3242,11 +3242,75 @@ class CampaignUpsertRequest(BaseModel):
     deadline: str = Field(default="", max_length=200)
     brief_link: str = Field(default="", max_length=500)
     guideline_text: str = Field(default="", max_length=50_000)
+    guideline_url: str = Field(default="", max_length=500)
     rules: Optional[List[dict]] = None
 
 
 class CampaignParseRequest(BaseModel):
     guideline_text: Optional[str] = Field(default=None, max_length=50_000)
+    guideline_url: Optional[str] = Field(default=None, max_length=500)
+
+
+class CampaignAssetFromUrlRequest(BaseModel):
+    url: str = Field(min_length=1, max_length=2000)
+    kind: str = Field(default="other", max_length=20)
+    note: str = Field(default="", max_length=1000)
+
+
+async def _download_asset_from_url(url: str, assets_dir: str, *, max_bytes: int) -> str:
+    """Stream a public URL into the campaign's assets dir; return the stored name.
+
+    Direct file URLs only (same guard the guideline fetcher uses). YouTube
+    pages are not file URLs — source video belongs in the analysis upload.
+    """
+    import httpx
+    from urllib.parse import unquote, urlparse
+    from security_utils import assert_public_url
+
+    current = assert_public_url(url.strip())
+    stored = None
+    async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0), follow_redirects=False, trust_env=False) as client:
+        target = current
+        for _ in range(6):
+            request = client.build_request("GET", target)
+            response = await client.send(request, stream=True)
+            if response.status_code in {301, 302, 303, 307, 308}:
+                location = response.headers.get("location")
+                await response.aclose()
+                if not location:
+                    raise HTTPException(status_code=422, detail="Asset URL redirect has no destination")
+                from urllib.parse import urljoin
+                target = urljoin(target, location)
+                assert_public_url(target)
+                continue
+            response.raise_for_status()
+            declared = response.headers.get("content-length")
+            if declared and int(declared) > max_bytes:
+                await response.aclose()
+                raise HTTPException(status_code=413, detail=f"Asset too large. Max size {max_bytes // (1024 * 1024)}MB")
+            safe = os.path.basename(unquote(urlparse(str(response.url)).path).replace("\\", "/")) or "asset"
+            stored = f"{uuid.uuid4()}_{safe}"[:300]
+            path = os.path.join(assets_dir, stored)
+            size = 0
+            try:
+                with open(path, "wb") as output:
+                    async for chunk in response.aiter_bytes(1024 * 1024):
+                        size += len(chunk)
+                        if size > max_bytes:
+                            raise HTTPException(status_code=413, detail=f"Asset too large. Max size {max_bytes // (1024 * 1024)}MB")
+                        output.write(chunk)
+            except HTTPException:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+                raise
+            finally:
+                await response.aclose()
+            break
+        else:
+            raise HTTPException(status_code=422, detail="Asset URL redirected too many times")
+    return stored
 
 
 def _campaign_owner_id(campaign_id: str) -> Optional[str]:
@@ -3297,6 +3361,7 @@ async def create_campaign_endpoint(body: CampaignUpsertRequest, request: Request
             deadline=body.deadline,
             brief_link=body.brief_link,
             guideline_text=body.guideline_text,
+            guideline_url=body.guideline_url,
         )
         if body.rules is not None:
             campaigns.set_rules(campaign, body.rules)
@@ -3362,6 +3427,16 @@ async def parse_campaign_guideline_endpoint(campaign_id: str, body: CampaignPars
     directory = await _assert_campaign_owner(request, campaign_id)
     _, campaign = _load_campaign_or_404(campaign_id)
     guideline_text = (body.guideline_text or "").strip() or str(campaign.get("guideline_text") or "").strip()
+    guideline_url = (body.guideline_url or "").strip() or str(campaign.get("guideline_url") or "").strip()
+    if guideline_url and not guideline_text:
+        try:
+            guideline_text = await asyncio.get_event_loop().run_in_executor(
+                None, fetch_guideline_text, guideline_url
+            )
+        except DraftValidationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=f"Could not fetch the guideline URL: {exc}") from None
     if not guideline_text:
         raise HTTPException(status_code=422, detail="Save the campaign guideline first or paste one in the request.")
     selected_provider = (
@@ -3380,8 +3455,9 @@ async def parse_campaign_guideline_endpoint(campaign_id: str, body: CampaignPars
             ),
         )
         campaigns.set_rules(campaign, parsed.get("rules", []))
-        if not campaign.get("guideline_text"):
-            campaign["guideline_text"] = guideline_text[:campaigns.MAX_GUIDELINE_CHARS]
+        campaign["guideline_text"] = guideline_text[:campaigns.MAX_GUIDELINE_CHARS]
+        if (body.guideline_url or "").strip():
+            campaign["guideline_url"] = body.guideline_url.strip()
     except DraftValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from None
     campaigns.save_campaign(directory, campaign)
@@ -3424,6 +3500,35 @@ async def add_campaign_asset(
     except campaigns.CampaignValidationError as exc:
         try:
             os.remove(path)
+        except OSError:
+            pass
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    campaigns.save_campaign(directory, campaign)
+    return campaigns.public_view(campaign)
+
+
+@app.post("/api/campaigns/{campaign_id}/assets-from-url")
+async def add_campaign_asset_from_url(campaign_id: str, body: CampaignAssetFromUrlRequest, request: Request):
+    """Register a public file URL as a campaign asset (downloaded server-side)."""
+    directory = await _assert_campaign_owner(request, campaign_id)
+    _, campaign = _load_campaign_or_404(campaign_id)
+    assets_dir = os.path.join(directory, "assets")
+    os.makedirs(assets_dir, exist_ok=True)
+    try:
+        stored_name = await _download_asset_from_url(
+            body.url, assets_dir, max_bytes=MAX_FILE_SIZE_MB * 1024 * 1024
+        )
+    except HTTPException:
+        raise
+    except campaigns.CampaignValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Could not download the asset: {exc}") from None
+    try:
+        campaigns.add_asset(campaign, asset_id=str(uuid.uuid4()), kind=body.kind, filename=stored_name, note=body.note)
+    except campaigns.CampaignValidationError as exc:
+        try:
+            os.remove(os.path.join(assets_dir, stored_name))
         except OSError:
             pass
         raise HTTPException(status_code=422, detail=str(exc)) from None

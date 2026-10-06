@@ -89,6 +89,7 @@ def create_campaign(
     deadline: Any = "",
     brief_link: Any = "",
     guideline_text: Any = "",
+    guideline_url: Any = "",
 ) -> dict[str, Any]:
     """Build the in-memory campaign document (not yet persisted)."""
     now = _now()
@@ -100,6 +101,7 @@ def create_campaign(
         "deadline": _clean_text(deadline, MAX_SHORT_TEXT, field="deadline"),
         "brief_link": _validate_brief_link(brief_link),
         "guideline_text": _clean_text(guideline_text, MAX_GUIDELINE_CHARS, field="guideline"),
+        "guideline_url": _validate_brief_link(guideline_url),
         "rules": [],
         "assets": [],
         "drafts": [],
@@ -178,6 +180,8 @@ def revise_campaign(campaign: dict[str, Any], changes: dict[str, Any]) -> dict[s
         campaign["brief_link"] = _validate_brief_link(changes["brief_link"])
     if "guideline_text" in changes:
         campaign["guideline_text"] = _clean_text(changes["guideline_text"], MAX_GUIDELINE_CHARS, field="guideline")
+    if "guideline_url" in changes:
+        campaign["guideline_url"] = _validate_brief_link(changes["guideline_url"])
     if changes.get("rules") is not None:
         campaign["rules"] = normalize_rules(changes["rules"])
     return campaign

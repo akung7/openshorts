@@ -252,3 +252,86 @@ async def _fake_key(_request):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CampaignUrlIngestTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        patcher = patch.object(campaigns, "CAMPAIGNS_DIR", str(root / "campaigns"))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.client = TestClient(app_module.app, raise_server_exceptions=False)
+
+    def test_parse_guideline_from_public_url(self):
+        created = self.client.post("/api/campaigns", json={"name": "URL brief"}).json()
+        cid = created["id"]
+
+        def fake_fetch(url):
+            self.assertEqual(url, "https://example.com/brief.pdf")
+            return "Mandatory: 30-60 seconds, hashtag #clippo."
+
+        async def fake_key(_request):
+            return "key"
+
+        def fake_parse(text, *, api_key=None, model=None, provider="gemini"):
+            self.assertIn("30-60", text)
+            return {"rules": [{"label": "Duration 30-60s", "description": ""}]}
+
+        with patch.object(app_module, "fetch_guideline_text", fake_fetch), \
+             patch.object(app_module, "resolve_gemini", fake_key), \
+             patch.object(app_module, "parse_campaign_guideline", fake_parse):
+            response = self.client.post(
+                f"/api/campaigns/{cid}/parse-guideline",
+                json={"guideline_url": "https://example.com/brief.pdf"},
+            )
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(body["rules"][0]["label"], "Duration 30-60s")
+        self.assertEqual(body["guideline_text"], "Mandatory: 30-60 seconds, hashtag #clippo.")
+        self.assertEqual(body["guideline_url"], "https://example.com/brief.pdf")
+
+    def test_asset_from_url_downloads_and_registers(self):
+        created = self.client.post("/api/campaigns", json={"name": "URL assets"}).json()
+        cid = created["id"]
+
+        async def fake_download(url, assets_dir, *, max_bytes):
+            self.assertTrue(assets_dir.endswith(os.path.join("assets")))
+            stored = "stored-clip.mp4"
+            with open(os.path.join(assets_dir, stored), "wb") as handle:
+                handle.write(b"videobytes")
+            return stored
+
+        with patch.object(app_module, "_download_asset_from_url", fake_download):
+            response = self.client.post(
+                f"/api/campaigns/{cid}/assets-from-url",
+                json={"url": "https://example.com/clip.mp4", "kind": "footage", "note": "drone shot"},
+            )
+        self.assertEqual(response.status_code, 200, response.text)
+        asset = response.json()["assets"][0]
+        self.assertEqual(asset["kind"], "footage")
+        self.assertEqual(asset["note"], "drone shot")
+        path = campaigns.asset_path(campaigns.campaign_dir(cid), asset)
+        self.assertTrue(os.path.isfile(path))
+        self.assertEqual(Path(path).read_bytes(), b"videobytes")
+
+    def test_asset_from_url_rejects_bad_kind_and_cleans_up(self):
+        created = self.client.post("/api/campaigns", json={"name": "Bad kind"}).json()
+        cid = created["id"]
+
+        async def fake_download(url, assets_dir, *, max_bytes):
+            stored = "x.bin"
+            with open(os.path.join(assets_dir, stored), "wb") as handle:
+                handle.write(b"x")
+            return stored
+
+        with patch.object(app_module, "_download_asset_from_url", fake_download):
+            response = self.client.post(
+                f"/api/campaigns/{cid}/assets-from-url",
+                json={"url": "https://example.com/x.bin", "kind": "meme"},
+            )
+        self.assertEqual(response.status_code, 422)
+        _, campaign = campaigns.load_campaign(cid)
+        self.assertEqual(campaign["assets"], [])
+        self.assertFalse(os.path.exists(os.path.join(campaigns.campaign_dir(cid), "assets", "x.bin")))
