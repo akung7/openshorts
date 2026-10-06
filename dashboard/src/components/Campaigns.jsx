@@ -457,7 +457,10 @@ export default function Campaigns({ onOpenDraft }) {
                 <input type="file" onChange={(e) => setAssetFile(e.target.files?.[0] || null)} className="block w-full text-sm text-muted file:mr-3 file:rounded-input file:border-0 file:bg-paper3 file:px-3 file:py-2 file:text-ink" />
               )}
               {assetMode === 'url' && (
-                <input type="url" value={assetUrl} onChange={(e) => setAssetUrl(e.target.value)} maxLength={2000} placeholder="https://example.com/footage-clip.mp4" className="input-field w-full" />
+                <>
+                  <input type="url" value={assetUrl} onChange={(e) => setAssetUrl(e.target.value)} maxLength={2000} placeholder="https://example.com/footage-clip.mp4" className="input-field w-full" />
+                  <p className="text-xs text-muted mt-2">Direct file links only. Google Drive: the file must be shared as "Anyone with the link" — private files cannot be downloaded by the server. Unsure? Use the Upload file tab.</p>
+                </>
               )}
               <div className="grid sm:grid-cols-[10rem_minmax(0,1fr)] gap-3 mt-3">
                 <label className="block"><span className="text-xs text-muted">Kind</span>
@@ -473,6 +476,7 @@ export default function Campaigns({ onOpenDraft }) {
                 <button type="button" onClick={submitAsset} disabled={busy === 'asset'} className="btn-primary px-3 py-2 text-xs disabled:opacity-50">{busy === 'asset' ? <Loader2 size={13} className="animate-spin" /> : <Plus size={13} />}{assetMode === 'file' ? 'Add asset' : 'Add asset from URL'}</button>
                 <span className="text-xs text-muted self-center">Add as many assets as the campaign needs.</span>
               </div>
+              {error && <p className="text-xs text-warn mt-2">{error}</p>}
               {(selected.assets || []).length > 0 && (
                 <ul className="mt-4 space-y-2">
                   {selected.assets.map((asset) => (
