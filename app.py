@@ -35,6 +35,7 @@ import recut
 import layout_ranges
 import watermarked
 import media_auth
+import campaigns
 from custom_campaign import (
     DraftValidationError,
     StaleDraftError,
@@ -46,6 +47,7 @@ from custom_campaign import (
     fetch_guideline_text,
     generate_campaign_chat,
     normalize_campaign_response,
+    parse_campaign_guideline,
     revise_draft,
 )
 
@@ -3227,6 +3229,224 @@ def layout_env(requested):
     return env
 
 
+# ---------------------------------------------------------------------------
+# Campaign workspace: long-lived containers for content-rewards clipping.
+# A campaign holds the parsed rules, reusable assets and the draft analyses
+# made from it; the analysis pipeline itself is unchanged.
+# ---------------------------------------------------------------------------
+
+class CampaignUpsertRequest(BaseModel):
+    name: str = Field(default="", max_length=120)
+    platform: str = Field(default="", max_length=200)
+    reward: str = Field(default="", max_length=200)
+    deadline: str = Field(default="", max_length=200)
+    brief_link: str = Field(default="", max_length=500)
+    guideline_text: str = Field(default="", max_length=50_000)
+    rules: Optional[List[dict]] = None
+
+
+class CampaignParseRequest(BaseModel):
+    guideline_text: Optional[str] = Field(default=None, max_length=50_000)
+
+
+def _campaign_owner_id(campaign_id: str) -> Optional[str]:
+    try:
+        owner_path = os.path.join(campaigns.campaign_dir(campaign_id), ".owner")
+    except campaigns.CampaignNotFoundError:
+        return None
+    try:
+        with open(owner_path, "r", encoding="utf-8") as handle:
+            return handle.read().strip() or None
+    except OSError:
+        return None
+
+
+def _load_campaign_or_404(campaign_id: str) -> tuple[str, dict]:
+    try:
+        return campaigns.load_campaign(campaign_id)
+    except campaigns.CampaignNotFoundError:
+        raise HTTPException(status_code=404, detail="Campaign not found") from None
+    except campaigns.CampaignValidationError:
+        raise HTTPException(status_code=500, detail="Could not read the saved campaign") from None
+
+
+async def _assert_campaign_owner(request: Request, campaign_id: str) -> str:
+    try:
+        directory = campaigns.campaign_dir(campaign_id)
+    except campaigns.CampaignNotFoundError:
+        raise HTTPException(status_code=404, detail="Campaign not found") from None
+    record = {}
+    owner_path = os.path.join(directory, ".owner")
+    try:
+        with open(owner_path, "r", encoding="utf-8") as handle:
+            record["user_id"] = handle.read().strip()
+    except FileNotFoundError:
+        if BILLING_ENABLED:
+            raise HTTPException(status_code=404, detail="Campaign not found") from None
+    await _assert_job_owner(request, record)
+    return directory
+
+
+@app.post("/api/campaigns")
+async def create_campaign_endpoint(body: CampaignUpsertRequest, request: Request):
+    try:
+        campaign = campaigns.create_campaign(
+            name=body.name,
+            platform=body.platform,
+            reward=body.reward,
+            deadline=body.deadline,
+            brief_link=body.brief_link,
+            guideline_text=body.guideline_text,
+        )
+        if body.rules is not None:
+            campaigns.set_rules(campaign, body.rules)
+    except campaigns.CampaignValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    directory = campaigns.campaign_dir(campaign["id"])
+    try:
+        os.makedirs(directory, exist_ok=False)
+    except OSError:
+        raise HTTPException(status_code=500, detail="Could not create the campaign directory") from None
+    user = await _user_from_request(request)
+    if user is not None:
+        with open(os.path.join(directory, ".owner"), "w", encoding="utf-8") as handle:
+            handle.write(str(user.id))
+    campaigns.save_campaign(directory, campaign)
+    return campaigns.public_view(campaign)
+
+
+@app.get("/api/campaigns")
+async def list_campaigns_endpoint(request: Request):
+    items = campaigns.list_campaigns()
+    if BILLING_ENABLED:
+        user = await _user_from_request(request)
+        if user is None:
+            items = []
+        else:
+            owner = str(user.id)
+            items = [item for item in items if _campaign_owner_id(item["id"]) == owner]
+    return {"campaigns": items}
+
+
+@app.get("/api/campaigns/{campaign_id}")
+async def get_campaign_endpoint(campaign_id: str, request: Request):
+    directory = await _assert_campaign_owner(request, campaign_id)
+    _, campaign = _load_campaign_or_404(campaign_id)
+    return campaigns.public_view(campaign)
+
+
+@app.put("/api/campaigns/{campaign_id}")
+async def update_campaign_endpoint(campaign_id: str, body: CampaignUpsertRequest, request: Request):
+    directory = await _assert_campaign_owner(request, campaign_id)
+    _, campaign = _load_campaign_or_404(campaign_id)
+    changes = body.dict()
+    try:
+        campaigns.revise_campaign(campaign, changes)
+    except campaigns.CampaignValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    campaigns.save_campaign(directory, campaign)
+    return campaigns.public_view(campaign)
+
+
+@app.delete("/api/campaigns/{campaign_id}")
+async def delete_campaign_endpoint(campaign_id: str, request: Request):
+    directory = await _assert_campaign_owner(request, campaign_id)
+    _load_campaign_or_404(campaign_id)  # 404 when missing/corrupt
+    campaigns.delete_campaign(directory)
+    return {"ok": True}
+
+
+@app.post("/api/campaigns/{campaign_id}/parse-guideline")
+async def parse_campaign_guideline_endpoint(campaign_id: str, body: CampaignParseRequest, request: Request):
+    """Turn the stored (or newly pasted) guideline into structured rules."""
+    directory = await _assert_campaign_owner(request, campaign_id)
+    _, campaign = _load_campaign_or_404(campaign_id)
+    guideline_text = (body.guideline_text or "").strip() or str(campaign.get("guideline_text") or "").strip()
+    if not guideline_text:
+        raise HTTPException(status_code=422, detail="Save the campaign guideline first or paste one in the request.")
+    selected_provider = (
+        "openai-compatible" if not BILLING_ENABLED and llm_backend.active() else "gemini"
+    )
+    key = await resolve_gemini(request) if selected_provider == "gemini" else None
+    try:
+        parsed = await asyncio.get_event_loop().run_in_executor(
+            None,
+            functools.partial(
+                parse_campaign_guideline,
+                guideline_text,
+                api_key=key,
+                model=os.environ.get("GEMINI_MODEL"),
+                provider=selected_provider,
+            ),
+        )
+        campaigns.set_rules(campaign, parsed.get("rules", []))
+        if not campaign.get("guideline_text"):
+            campaign["guideline_text"] = guideline_text[:campaigns.MAX_GUIDELINE_CHARS]
+    except DraftValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    campaigns.save_campaign(directory, campaign)
+    return campaigns.public_view(campaign)
+
+
+@app.post("/api/campaigns/{campaign_id}/assets")
+async def add_campaign_asset(
+    campaign_id: str,
+    request: Request,
+    file: UploadFile = File(...),
+    kind: str = Form("other"),
+    note: str = Form(""),
+):
+    directory = await _assert_campaign_owner(request, campaign_id)
+    _, campaign = _load_campaign_or_404(campaign_id)
+    asset_id = str(uuid.uuid4())
+    stored_name = f"{asset_id}_{campaigns.safe_filename(file.filename)}"
+    if stored_name == f"{asset_id}_":
+        raise HTTPException(status_code=422, detail="Asset file has no name")
+    assets_dir = os.path.join(directory, "assets")
+    os.makedirs(assets_dir, exist_ok=True)
+    path = os.path.join(assets_dir, stored_name)
+    size = 0
+    limit_bytes = MAX_FILE_SIZE_MB * 1024 * 1024
+    try:
+        with open(path, "wb") as output:
+            while chunk := await file.read(1024 * 1024):
+                size += len(chunk)
+                if size > limit_bytes:
+                    raise HTTPException(status_code=413, detail=f"Asset too large. Max size {MAX_FILE_SIZE_MB}MB")
+                output.write(chunk)
+        campaigns.add_asset(campaign, asset_id=asset_id, kind=kind, filename=stored_name, note=note)
+    except HTTPException:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        raise
+    except campaigns.CampaignValidationError as exc:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    campaigns.save_campaign(directory, campaign)
+    return campaigns.public_view(campaign)
+
+
+@app.delete("/api/campaigns/{campaign_id}/assets/{asset_id}")
+async def delete_campaign_asset(campaign_id: str, asset_id: str, request: Request):
+    directory = await _assert_campaign_owner(request, campaign_id)
+    _, campaign = _load_campaign_or_404(campaign_id)
+    try:
+        asset = campaigns.remove_asset(campaign, asset_id)
+    except campaigns.CampaignValidationError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from None
+    try:
+        os.remove(campaigns.asset_path(directory, asset))
+    except (OSError, campaigns.CampaignValidationError):
+        pass  # the record is gone either way; a stray file is harmless
+    campaigns.save_campaign(directory, campaign)
+    return campaigns.public_view(campaign)
+
+
 @app.post("/api/custom/analyze")
 async def custom_analyze_endpoint(
     request: Request,
@@ -3237,6 +3457,7 @@ async def custom_analyze_endpoint(
     guideline_text: Optional[str] = Form(None),
     acknowledged: Optional[str] = Form(None),
     ai_provider: Optional[str] = Form(None),
+    campaign_id: Optional[str] = Form(None),
 ):
     """Create a campaign-analysis job. This endpoint never renders clips."""
     api_key = await resolve_gemini(request)
@@ -3257,8 +3478,20 @@ async def custom_analyze_endpoint(
         raise HTTPException(status_code=400, detail="Confirm that you own the source or have rights to use it.")
     if bool(file) == bool(url):
         raise HTTPException(status_code=400, detail="Provide exactly one source video file or URL.")
+    campaign = None
+    if campaign_id:
+        try:
+            _, campaign = campaigns.load_campaign(campaign_id)
+        except campaigns.CampaignNotFoundError:
+            raise HTTPException(status_code=404, detail="Campaign not found") from None
     guide_count = sum(bool(value) for value in (guideline_file, guideline_url, guideline_text and guideline_text.strip()))
-    if guide_count != 1:
+    if campaign_id:
+        # The campaign's stored guideline can stand in for a pasted/uploaded one.
+        if guide_count > 1:
+            raise HTTPException(status_code=400, detail="Provide exactly one guideline file, public URL, or text brief.")
+        if guide_count == 0 and not str(campaign.get("guideline_text") or "").strip():
+            raise HTTPException(status_code=422, detail="This campaign has no guideline text yet; add it before analyzing.")
+    elif guide_count != 1:
         raise HTTPException(status_code=400, detail="Provide exactly one guideline file, public URL, or text brief.")
 
     if url:
@@ -3279,12 +3512,22 @@ async def custom_analyze_endpoint(
             guide = (guideline_text or "").strip()
             if len(guide.encode("utf-8")) > 5 * 1024 * 1024:
                 raise DraftValidationError("Guideline text exceeds the 5 MB limit")
-            if not guide:
+            if not guide and not campaign_id:
+                # With a campaign selected its stored guideline supplies the text.
                 raise DraftValidationError("Guideline text is empty")
     except DraftValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Could not read the guideline: {exc}")
+
+    if campaign is not None:
+        if not guide and campaign.get("guideline_text"):
+            guide = campaign["guideline_text"]
+        rules_block = campaigns.rules_prompt_block(campaign)
+        if rules_block:
+            guide = f"{guide}\n\n{rules_block}" if guide else rules_block
+        if not guide.strip():
+            raise HTTPException(status_code=422, detail="This campaign has no guideline text yet; add it before analyzing.")
 
     job_id = str(uuid.uuid4())
     job_output_dir = os.path.join(OUTPUT_DIR, job_id)
@@ -3371,8 +3614,16 @@ async def custom_analyze_endpoint(
             skip_statics=bool(url) and bool(getattr(request.state, "skip_statics", False)),
             job_type="custom_analysis",
         )
+        if campaign is not None:
+            campaigns.attach_draft(campaign, job_id)
+            campaigns.save_campaign(campaigns.campaign_dir(campaign["id"]), campaign)
         _enqueue_job(job_id, priority)
-        return {"draft_id": job_id, "job_id": job_id, "status": "queued"}
+        return {
+            "draft_id": job_id,
+            "job_id": job_id,
+            "status": "queued",
+            "campaign_id": campaign["id"] if campaign is not None else None,
+        }
     except Exception:
         if reservation_id:
             await _drop_unstarted_job(reservation_id, job_output_dir)

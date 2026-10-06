@@ -18,6 +18,7 @@ from urllib.parse import urljoin, urlparse
 import uuid
 
 from security_utils import assert_public_url
+from pydantic import BaseModel
 
 
 MAX_GUIDELINE_BYTES = 5 * 1024 * 1024
@@ -785,3 +786,81 @@ def assert_approved_draft(draft: dict[str, Any]) -> list[dict[str, Any]]:
         if not math.isfinite(start) or not math.isfinite(end) or start < 0 or end <= start:
             raise DraftValidationError("Approved clip timestamps are invalid")
     return deepcopy(clips)
+
+
+class ParsedRule(BaseModel):
+    label: str
+    description: str = ""
+
+
+class GuidelineRulesResponse(BaseModel):
+    rules: list[ParsedRule]
+
+
+def build_guideline_rules_prompt(guideline_text: str) -> str:
+    """Turn a raw campaign brief into a deterministic rule-extraction prompt."""
+    return (
+        "You extract the mandatory rules of a content-rewards clipping campaign "
+        "so a clipper can check every proposed short-form video against them.\n"
+        "Read the campaign guideline below and return JSON with a \"rules\" list.\n"
+        "Each rule is one checkable requirement with a short imperative label "
+        "(max 120 characters, e.g. \"Video length 30-60 seconds\") and a "
+        "description with the concrete details (numbers, hashtags, do/don't).\n"
+        "Cover, when present: video length, caption/caption-format and hashtag "
+        "requirements, branding/watermark/logo rules, music rules, language, "
+        "prohibited content, submission format and anything marked mandatory or "
+        "disqualifying. Skip marketing fluff that cannot be checked. Return at "
+        "most 40 rules, ordered from most to least important.\n\n"
+        "CAMPAIGN GUIDELINE:\n" + guideline_text
+    )
+
+
+def parse_campaign_guideline(
+    guideline_text: str,
+    *,
+    api_key: str | None = None,
+    model: str | None = None,
+    provider: str | None = "gemini",
+) -> dict[str, Any]:
+    """Extract structured, checkable rules from a raw campaign guideline."""
+    text = str(guideline_text or "").strip()
+    if not text:
+        raise DraftValidationError("Campaign guideline is empty")
+    if len(text) > MAX_GUIDELINE_CHARS:
+        raise DraftValidationError("Campaign guideline is too long")
+    prompt = build_guideline_rules_prompt(text)
+
+    import llm_backend
+
+    if _uses_compatible_provider(provider, llm_backend):
+        parsed, _cost = llm_backend.generate_json(
+            prompt, GuidelineRulesResponse, model=model or llm_backend.model_name()
+        )
+        rules = parsed.get("rules", []) if isinstance(parsed, dict) else []
+        return {"rules": [rule if isinstance(rule, dict) else rule.model_dump() for rule in rules]}
+    if not api_key:
+        raise DraftValidationError("No AI provider is configured for guideline parsing")
+
+    from google import genai
+    from google.genai import types as genai_types
+
+    selected_model = model or os.environ.get("GEMINI_MODEL") or "gemini-3.1-flash-lite"
+    # Hold a reference: the SDK's Client.__del__ closes the HTTP client, and an
+    # inline chained temporary can be finalized mid-call ("client has been closed").
+    client = genai.Client(api_key=api_key)
+    response = client.models.generate_content(
+        model=selected_model,
+        contents=prompt,
+        config=genai_types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=GuidelineRulesResponse,
+        ),
+    )
+    parsed = getattr(response, "parsed", None)
+    if parsed is None:
+        try:
+            parsed = GuidelineRulesResponse.model_validate_json(response.text)
+        except (TypeError, ValueError) as exc:
+            raise DraftValidationError(f"AI returned invalid campaign rules JSON: {exc}") from exc
+    rules = parsed.rules if hasattr(parsed, "rules") else parsed.get("rules", [])
+    return {"rules": [rule.model_dump() if hasattr(rule, "model_dump") else dict(rule) for rule in rules]}
