@@ -105,7 +105,7 @@ export default function Campaigns({ onOpenDraft }) {
     setError('');
     setBusy('create');
     try {
-      const campaign = await apiJson('/api/campaigns', { method: 'POST', body: JSON.stringify(newForm) });
+      const campaign = await apiJson('/api/campaigns', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(newForm) });
       setNewForm({ name: '', platform: '', reward: '', deadline: '', brief_link: '', guideline_text: '', guideline_url: '' });
       setCreating(false);
       await refresh();
@@ -128,6 +128,7 @@ export default function Campaigns({ onOpenDraft }) {
     try {
       const updated = await apiJson(`/api/campaigns/${encodeURIComponent(selected.id)}`, {
         method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ...selected, guideline_text: guidelineDraft, guideline_url: guideUrl }),
       });
       setSelected(updated);
@@ -208,6 +209,7 @@ export default function Campaigns({ onOpenDraft }) {
     try {
       const updated = await apiJson(`/api/campaigns/${encodeURIComponent(selected.id)}`, {
         method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ...selected, guideline_text: guidelineDraft, guideline_url: guideUrl }),
       });
       applyUpdated(updated, 'Guideline link saved.');
@@ -241,6 +243,7 @@ export default function Campaigns({ onOpenDraft }) {
       } else {
         updated = await apiJson(`/api/campaigns/${encodeURIComponent(selected.id)}/assets-from-url`, {
           method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ url: assetUrl.trim(), kind: assetKind, note: assetNote }),
         });
       }

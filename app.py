@@ -3447,8 +3447,12 @@ async def parse_campaign_guideline_endpoint(campaign_id: str, body: CampaignPars
     """Turn the stored (or newly pasted) guideline into structured rules."""
     directory = await _assert_campaign_owner(request, campaign_id)
     _, campaign = _load_campaign_or_404(campaign_id)
-    guideline_text = (body.guideline_text or "").strip() or str(campaign.get("guideline_text") or "").strip()
-    guideline_url = (body.guideline_url or "").strip() or str(campaign.get("guideline_url") or "").strip()
+    body_text = (body.guideline_text or "").strip()
+    body_url = (body.guideline_url or "").strip()
+    # An explicitly pasted URL wins over previously stored text: the caller
+    # asked for a fresh fetch of that link.
+    guideline_text = body_text if body_url and not body_text else (body_text or str(campaign.get("guideline_text") or "").strip())
+    guideline_url = body_url or str(campaign.get("guideline_url") or "").strip()
     if guideline_url and not guideline_text:
         try:
             guideline_text = await asyncio.get_event_loop().run_in_executor(
