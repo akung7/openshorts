@@ -16,6 +16,7 @@ import math
 import itertools
 import functools
 import asyncio
+import copy
 import signal
 import socket
 from datetime import datetime, timezone, timedelta
@@ -33,6 +34,17 @@ import recut
 import layout_ranges
 import watermarked
 import media_auth
+from custom_campaign import (
+    DraftValidationError,
+    approve_draft,
+    assert_approved_draft,
+    build_approved_render_plan,
+    extract_guideline_text,
+    fetch_guideline_text,
+    generate_campaign_chat,
+    normalize_campaign_response,
+    revise_draft,
+)
 
 load_dotenv()
 
@@ -561,6 +573,7 @@ async def _assert_job_owner(request, record):
 job_queue = asyncio.PriorityQueue()
 _job_seq = itertools.count()
 jobs: Dict[str, Dict] = {}
+custom_draft_locks: Dict[str, asyncio.Lock] = {}
 thumbnail_sessions: Dict[str, Dict] = {}
 publish_jobs: Dict[str, Dict] = {}  # {publish_id: {status, result, error}}
 # Semester to limit concurrency to MAX_CONCURRENT_JOBS
@@ -1354,7 +1367,8 @@ def _install_drain_signal_handler():
 
 def _write_resume_manifest(job_id, cmd, priority, user_id, reservation_id, watermark,
                            webhook_url=None, webhook_secret=None, base_url=None,
-                           partial=None, source_cap_minutes=None, skip_statics=False):
+                           partial=None, source_cap_minutes=None, skip_statics=False,
+                           job_type=None):
     try:
         path = os.path.join(OUTPUT_DIR, job_id, _RESUME_FILE)
         with open(path, "w") as f:
@@ -1378,6 +1392,7 @@ def _write_resume_manifest(job_id, cmd, priority, user_id, reservation_id, water
                 "source_cap_minutes": source_cap_minutes,
                 # The probe's "statics bot-checked for this video" verdict.
                 "skip_statics": bool(skip_statics),
+                "job_type": job_type,
             }, f)
     except Exception as e:
         print(f"⚠️ Could not write resume manifest for {job_id}: {e}")
@@ -1502,6 +1517,7 @@ def _resume_interrupted_jobs() -> set:
             'webhook_url': m.get("webhook_url"),
             'webhook_secret': m.get("webhook_secret"),
             'base_url': m.get("base_url"),
+            'job_type': m.get("job_type"),
         }
         _enqueue_job(job_id, int(m.get("priority", 2)))
         resumed += 1
@@ -1862,21 +1878,20 @@ async def run_job_wrapper(job_id):
         # Settle the minute reservation (managed jobs only): commit on success,
         # release otherwise so the minutes go back to the user.
         await _settle_reservation(job_id, job)
-        # Archive the completed clips to the user's durable R2 library (history).
-        await _archive_managed_job(job_id)
-        # Autopilot bookkeeping + autopublish (before the generic clips-ready
-        # email, which it replaces for its own jobs).
-        await _autopilot_job_finished(job_id, job)
+        # Custom analysis has no rendered clips to archive or deliver; keep its
+        # private draft local until the user approves a separate render job.
+        if not job or job.get('job_type') != 'custom_analysis':
+            await _archive_managed_job(job_id)
+            # Autopilot bookkeeping + autopublish (before generic clip-ready email).
+            await _autopilot_job_finished(job_id, job)
+            await _notify_clips_ready(job_id)
+            await _notify_clip_activity(job_id)
         # Fire the caller's webhook (after archive, so durable links exist).
         await _notify_job_webhook(job_id)
         # Operational alerting for managed jobs (proxy out of credits / failures).
         await _record_job_alert(job_id)
         # Accumulate proxy bandwidth for the monthly cost alert.
         await _track_proxy_usage(job_id)
-        # Tell the owner their clips are ready (managed jobs, once per job).
-        await _notify_clips_ready(job_id)
-        # Telegram pulse for high-signal activity (first clip / paid user).
-        await _notify_clip_activity(job_id)
         # Always release semaphore and mark queue task done
         _running_jobs.discard(job_id)
         concurrency_semaphore.release()
@@ -2468,6 +2483,125 @@ def _safe_under(base_dir: str, user_rel_path: str) -> Optional[str]:
 class ProcessRequest(BaseModel):
     url: str
 
+
+class CustomChatRequest(BaseModel):
+    message: str
+    revision: int
+
+
+class CustomApprovalRequest(BaseModel):
+    revision: int
+    selected_clip_ids: List[str]
+
+@app.post("/api/custom/drafts/{draft_id}/approve")
+async def approve_custom_draft(draft_id: str, body: CustomApprovalRequest, request: Request):
+    """Approve the exact proposal revision and enqueue only those time ranges."""
+    canonical_id = str(uuid.UUID(_custom_draft_dir(draft_id).split(os.sep)[-1]))
+    lock = custom_draft_locks.setdefault(canonical_id, asyncio.Lock())
+    async with lock:
+        directory = await _assert_custom_draft_owner(request, canonical_id)
+        directory, draft = _read_custom_draft(canonical_id)
+        if draft.get("render_job_id"):
+            raise HTTPException(status_code=409, detail="This draft has already been submitted for rendering.")
+        key = await resolve_gemini(request)
+        try:
+            approved = approve_draft(
+                draft, revision=body.revision, selected_clip_ids=body.selected_clip_ids
+            )
+            render_plan = build_approved_render_plan(approved)
+        except DraftValidationError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+
+        source = _custom_source_path(canonical_id, directory, draft)
+        if not source or not os.path.isfile(source):
+            raise HTTPException(status_code=410, detail="Source video expired; analyze it again before rendering.")
+
+        render_id = str(uuid.uuid4())
+        render_dir = os.path.join(OUTPUT_DIR, render_id)
+        staged_source = os.path.join(UPLOAD_DIR, f"{render_id}_{os.path.basename(source)}")
+        os.makedirs(render_dir, exist_ok=False)
+        reservation_id = None
+        try:
+            shutil.copyfile(source, staged_source)
+            _render_key = key
+            user_id, priority, reservation_id, user_plan, partial = await reserve_process_minutes(
+                request, None, staged_source, render_id
+            )
+            if partial:
+                allowed_seconds = float(partial["processed_minutes"]) * 60
+                if any(float(clip["end"]) > allowed_seconds for clip in render_plan["clips"]):
+                    raise HTTPException(
+                        status_code=402,
+                        detail="The approved clip ranges exceed the minutes available; select only clips within the offered partial duration or add minutes.",
+                    )
+            plan_path = os.path.join(render_dir, "approved_plan.json")
+            with open(plan_path, "w", encoding="utf-8") as handle:
+                json.dump(render_plan, handle, ensure_ascii=False)
+            cmd = [
+                sys.executable, "-u", "main.py",
+                "-i", staged_source,
+                "-o", render_dir,
+                "--format", "vertical",
+                "--custom-render-plan", plan_path,
+            ]
+            env = child_env()
+            env.setdefault("PYTHONIOENCODING", "utf-8")
+            if partial:
+                env["MAX_SOURCE_MINUTES"] = str(partial["processed_minutes"])
+            else:
+                env.pop("MAX_SOURCE_MINUTES", None)
+            if _render_key:
+                env["GEMINI_API_KEY"] = _render_key
+            if user_plan == "free":
+                env["WATERMARK"] = "1"
+            jobs[render_id] = {
+                "status": "queued",
+                "logs": _TimedLog([f"Approved custom render {render_id} queued."]),
+                "cmd": cmd,
+                "env": env,
+                "output_dir": render_dir,
+                "user_id": user_id,
+                "reservation_id": reservation_id,
+                "watermark": user_plan == "free",
+                "partial": partial,
+                "job_type": "custom_render",
+                "user_plan": user_plan,
+            }
+            if user_id is not None:
+                with open(os.path.join(render_dir, ".owner"), "w", encoding="utf-8") as handle:
+                    handle.write(str(user_id))
+            _write_resume_manifest(
+                render_id, cmd, priority, user_id, reservation_id,
+                watermark=jobs[render_id]["watermark"],
+                job_type="custom_render",
+            )
+            approved["render_job_id"] = render_id
+            approved["render_status"] = "queued"
+            _save_custom_draft(directory, approved)
+            _enqueue_job(render_id, priority)
+            return {"job_id": render_id, "status": "queued"}
+        except Exception:
+            jobs.pop(render_id, None)
+            try:
+                # Queue submission is part of approval's transaction: if it
+                # fails, leave the original editable draft available to retry.
+                _save_custom_draft(directory, draft)
+            except Exception:
+                pass
+            if reservation_id:
+                try:
+                    await _drop_unstarted_job(reservation_id, render_dir)
+                except Exception:
+                    pass
+            else:
+                shutil.rmtree(render_dir, ignore_errors=True)
+            if os.path.exists(staged_source):
+                try:
+                    os.remove(staged_source)
+                except OSError:
+                    pass
+            raise
+
 # Masks user:password credentials embedded in any URL (e.g. the residential
 # proxy URL that yt-dlp echoes in its verbose debug output) before the line is
 # ever printed to the server console or stored in the job log.
@@ -2674,7 +2808,20 @@ async def run_job(job_id, job_data):
 
         returncode = process.returncode
         
-        if returncode == 0:
+        if returncode == 0 and job_data.get("job_type") == "custom_analysis":
+            draft_path = os.path.join(output_dir, "custom_draft.json")
+            try:
+                with open(draft_path, "r", encoding="utf-8") as f:
+                    draft = json.load(f)
+                if draft.get("id") != job_id or not draft.get("clips"):
+                    raise ValueError("custom draft missing its id or clip proposals")
+                jobs[job_id]["status"] = "completed"
+                jobs[job_id]["result"] = {"custom_draft_id": job_id}
+                jobs[job_id]["logs"].append("Campaign analysis ready for review; no clips were rendered.")
+            except Exception as e:
+                jobs[job_id]["status"] = "failed"
+                jobs[job_id]["logs"].append(f"Custom campaign analysis did not produce a valid draft: {e}")
+        elif returncode == 0:
             jobs[job_id]['status'] = 'completed'
             jobs[job_id]['logs'].append("Process finished successfully.")
             
@@ -3023,6 +3170,276 @@ def layout_env(requested):
             env[extra] = "1"
     return env
 
+
+@app.post("/api/custom/analyze")
+async def custom_analyze_endpoint(
+    request: Request,
+    file: Optional[UploadFile] = File(None),
+    url: Optional[str] = Form(None),
+    guideline_file: Optional[UploadFile] = File(None),
+    guideline_url: Optional[str] = Form(None),
+    guideline_text: Optional[str] = Form(None),
+    acknowledged: Optional[str] = Form(None),
+):
+    """Create a campaign-analysis job. This endpoint never renders clips."""
+    api_key = await resolve_gemini(request)
+    if not api_key and not (llm_backend.active() and not BILLING_ENABLED):
+        raise gemini_missing_error()
+    if str(acknowledged).lower() not in ("1", "true", "yes"):
+        raise HTTPException(status_code=400, detail="Confirm that you own the source or have rights to use it.")
+    if bool(file) == bool(url):
+        raise HTTPException(status_code=400, detail="Provide exactly one source video file or URL.")
+    guide_count = sum(bool(value) for value in (guideline_file, guideline_url, guideline_text and guideline_text.strip()))
+    if guide_count != 1:
+        raise HTTPException(status_code=400, detail="Provide exactly one guideline file, public URL, or text brief.")
+
+    if url:
+        if DISABLE_YOUTUBE_URL:
+            raise HTTPException(status_code=403, detail="URL ingest is disabled on this deployment. Upload a source you own.")
+        await _validate_source_url(url)
+
+    loop = asyncio.get_event_loop()
+    try:
+        if guideline_file:
+            guide_bytes = await guideline_file.read(5 * 1024 * 1024 + 1)
+            guide = await loop.run_in_executor(
+                None, extract_guideline_text, guideline_file.filename or "guideline.pdf", guide_bytes
+            )
+        elif guideline_url:
+            guide = await loop.run_in_executor(None, fetch_guideline_text, guideline_url)
+        else:
+            guide = (guideline_text or "").strip()
+            if len(guide.encode("utf-8")) > 5 * 1024 * 1024:
+                raise DraftValidationError("Guideline text exceeds the 5 MB limit")
+            if not guide:
+                raise DraftValidationError("Guideline text is empty")
+    except DraftValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Could not read the guideline: {exc}")
+
+    job_id = str(uuid.uuid4())
+    job_output_dir = os.path.join(OUTPUT_DIR, job_id)
+    os.makedirs(job_output_dir, exist_ok=False)
+    guideline_path = os.path.join(job_output_dir, "campaign_guideline.txt")
+    with open(guideline_path, "w", encoding="utf-8") as handle:
+        handle.write(guide)
+
+    input_path = None
+    reservation_id = None
+    try:
+        if file:
+            safe_name = os.path.basename(file.filename or "source.mp4") or "source.mp4"
+            input_path = os.path.join(UPLOAD_DIR, f"{job_id}_{safe_name}")
+            size = 0
+            limit_bytes = MAX_FILE_SIZE_MB * 1024 * 1024
+            with open(input_path, "wb") as output:
+                while chunk := await file.read(1024 * 1024):
+                    size += len(chunk)
+                    if size > limit_bytes:
+                        raise HTTPException(status_code=413, detail=f"File too large. Max size {MAX_FILE_SIZE_MB}MB")
+                    output.write(chunk)
+            # Do not apply the legacy minimum-source gate here: campaign
+            # analysis can identify a valid short-form excerpt in short video.
+
+        user_id, priority, reservation_id, user_plan, partial = await reserve_process_minutes(
+            request, url, input_path, job_id
+        )
+        env = child_env()
+        env.setdefault("PYTHONIOENCODING", "utf-8")
+        if api_key:
+            env["GEMINI_API_KEY"] = api_key
+        else:
+            env.pop("GEMINI_API_KEY", None)
+        if partial:
+            env["MAX_SOURCE_MINUTES"] = str(partial["processed_minutes"])
+            env.pop("SOURCE_CAP_MINUTES", None)
+        elif url and getattr(request.state, "reserved_minutes", None):
+            env["SOURCE_CAP_MINUTES"] = str(request.state.reserved_minutes)
+        else:
+            env.pop("SOURCE_CAP_MINUTES", None)
+        if getattr(request.state, "skip_statics", False):
+            env["DOWNLOAD_SKIP_STATICS"] = "1"
+        else:
+            env.pop("DOWNLOAD_SKIP_STATICS", None)
+
+        cmd = [sys.executable, "-u", "main.py"]
+        if url:
+            cmd.extend(["-u", url, "--keep-original"])
+        else:
+            cmd.extend(["-i", input_path])
+        cmd.extend([
+            "-o", job_output_dir,
+            "--custom-analyze",
+            "--campaign-guideline", guideline_path,
+            "--draft-id", job_id,
+        ])
+        jobs[job_id] = {
+            "status": "queued",
+            "logs": _TimedLog([f"Custom campaign analysis {job_id} queued."]),
+            "cmd": cmd,
+            "env": env,
+            "output_dir": job_output_dir,
+            "user_id": user_id,
+            "reservation_id": reservation_id,
+            "watermark": user_plan == "free",
+            "partial": partial,
+            "job_type": "custom_analysis",
+            "source_url": url,
+            "user_plan": user_plan,
+        }
+        if user_plan == "free":
+            env["WATERMARK"] = "1"
+        if user_id is not None:
+            with open(os.path.join(job_output_dir, ".owner"), "w", encoding="utf-8") as handle:
+                handle.write(str(user_id))
+        _write_resume_manifest(
+            job_id, cmd, priority, user_id, reservation_id,
+            watermark=jobs[job_id]["watermark"],
+            partial=partial,
+            source_cap_minutes=getattr(request.state, "reserved_minutes", None) if url and not partial else None,
+            skip_statics=bool(url) and bool(getattr(request.state, "skip_statics", False)),
+            job_type="custom_analysis",
+        )
+        _enqueue_job(job_id, priority)
+        return {"draft_id": job_id, "job_id": job_id, "status": "queued"}
+    except Exception:
+        if reservation_id:
+            await _drop_unstarted_job(reservation_id, job_output_dir)
+        else:
+            shutil.rmtree(job_output_dir, ignore_errors=True)
+        jobs.pop(job_id, None)
+        if input_path and os.path.exists(input_path):
+            try:
+                os.remove(input_path)
+            except OSError:
+                pass
+        raise
+
+
+def _custom_draft_dir(draft_id: str) -> str:
+    try:
+        canonical_id = str(uuid.UUID(draft_id))
+    except (TypeError, ValueError, AttributeError):
+        raise HTTPException(status_code=404, detail="Draft not found")
+    return os.path.join(OUTPUT_DIR, canonical_id)
+
+
+def _read_custom_draft(draft_id: str) -> tuple[str, dict]:
+    directory = _custom_draft_dir(draft_id)
+    path = os.path.join(directory, "custom_draft.json")
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            draft = json.load(handle)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Draft analysis is not ready")
+    except (OSError, json.JSONDecodeError):
+        raise HTTPException(status_code=500, detail="Could not read the saved custom draft")
+    if draft.get("id") != os.path.basename(directory):
+        raise HTTPException(status_code=404, detail="Draft not found")
+    return directory, draft
+
+
+def _save_custom_draft(directory: str, draft: dict) -> None:
+    path = os.path.join(directory, "custom_draft.json")
+    temp = path + ".tmp"
+    with open(temp, "w", encoding="utf-8") as handle:
+        json.dump(draft, handle, ensure_ascii=False, indent=2)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temp, path)
+
+
+def _custom_draft_public_view(draft: dict) -> dict:
+    result = copy.deepcopy(draft)
+    for private_key in ("guideline_text", "transcript", "source_video", "approved_clips", "approval_hash", "source_path"):
+        result.pop(private_key, None)
+    return result
+
+
+async def _assert_custom_draft_owner(request: Request, draft_id: str) -> str:
+    directory = _custom_draft_dir(draft_id)
+    record = jobs.get(str(uuid.UUID(draft_id))) or {}
+    owner_path = os.path.join(directory, ".owner")
+    try:
+        with open(owner_path, "r", encoding="utf-8") as handle:
+            record["user_id"] = handle.read().strip()
+    except FileNotFoundError:
+        if BILLING_ENABLED and record.get("user_id") is None:
+            raise HTTPException(status_code=404, detail="Not found")
+    await _assert_job_owner(request, record)
+    return directory
+
+
+def _custom_source_path(draft_id: str, directory: str, draft: dict) -> str:
+    # Uploaded video remains in uploads/{draft_id}_*. URL video is retained in
+    # the draft's output directory by the worker's --keep-original option.
+    uploaded = [
+        path for path in glob.glob(os.path.join(UPLOAD_DIR, f"{glob.escape(draft_id)}_*"))
+        if not os.path.basename(path).startswith("thumb_")
+    ]
+    if uploaded:
+        return uploaded[0]
+    source_name = os.path.basename(str(draft.get("source_video") or ""))
+    candidate = os.path.realpath(os.path.join(directory, source_name))
+    root = os.path.realpath(directory) + os.sep
+    if source_name and candidate.startswith(root) and os.path.isfile(candidate):
+        return candidate
+    return ""
+
+
+@app.get("/api/custom/drafts/{draft_id}")
+async def get_custom_draft(draft_id: str, request: Request):
+    directory = await _assert_custom_draft_owner(request, draft_id)
+    _, draft = _read_custom_draft(draft_id)
+    job = jobs.get(str(uuid.UUID(draft_id))) or {}
+    result = _custom_draft_public_view(draft)
+    result["analysis_status"] = job.get("status", draft.get("status"))
+    return result
+
+
+@app.post("/api/custom/drafts/{draft_id}/chat")
+async def discuss_custom_draft(draft_id: str, body: CustomChatRequest, request: Request):
+    directory = await _assert_custom_draft_owner(request, draft_id)
+    directory, draft = _read_custom_draft(draft_id)
+    if draft.get("status") != "draft":
+        raise HTTPException(status_code=409, detail="Only an unapproved draft can be discussed.")
+    message = body.message.strip()
+    if not message or len(message) > 4000:
+        raise HTTPException(status_code=400, detail="Message must be 1–4000 characters.")
+    if body.revision != draft.get("revision"):
+        raise HTTPException(status_code=409, detail="Draft changed; refresh before sending another message.")
+    key = await resolve_gemini(request)
+    try:
+        loop = asyncio.get_event_loop()
+        generated = await loop.run_in_executor(
+            None,
+            functools.partial(
+                generate_campaign_chat,
+                api_key=key,
+                draft=draft,
+                message=message,
+                guideline_text=draft.get("guideline_text", ""),
+            ),
+        )
+        normalized = normalize_campaign_response(
+            generated, draft.get("video_duration", 0), transcript=draft.get("transcript")
+        )
+        updated = revise_draft(draft, normalized)
+    except DraftValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Campaign discussion failed: {exc}")
+    history = list(draft.get("chat_history") or [])
+    history.extend([{"role": "user", "content": message}, {"role": "assistant", "content": str(generated.get("reply") or "") }])
+    updated["chat_history"] = history[-20:]
+    updated["last_reply"] = str(generated.get("reply") or "")
+    updated["guideline_text"] = draft.get("guideline_text", "")
+    updated["transcript"] = draft.get("transcript")
+    updated["video_duration"] = draft.get("video_duration")
+    updated["source_video"] = draft.get("source_video")
+    _save_custom_draft(directory, updated)
+    return {"reply": updated["last_reply"], "draft": _custom_draft_public_view(updated)}
 
 @app.post("/api/process")
 async def process_endpoint(

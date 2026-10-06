@@ -28,6 +28,7 @@ import HistoryTab from './components/HistoryTab';
 import AutopilotTab from './components/AutopilotTab';
 import ProfileMenu from './components/ProfileMenu';
 import Modal from './components/ui/Modal';
+import CustomClips from './components/CustomClips';
 import { useAuth } from './contexts/AuthContext';
 import { apiFetch, apiJson, QuotaError } from './lib/api';
 import { track } from './lib/analytics';
@@ -1200,7 +1201,8 @@ function App() {
     { id: 'ugc-gallery', ord: '05', icon: LayoutGrid, label: 'UGC Gallery', short: 'gallery', primary: true },
     { id: 'thumbnails', ord: '06', icon: Image, label: 'YouTube Studio', short: 'studio', primary: true },
     ...(billingEnabled && isSignedIn ? [{ id: 'history', ord: '07', icon: History, label: 'History', short: 'history' }] : []),
-    { id: 'settings', ord: '08', icon: Settings, label: 'Settings', short: 'settings' },
+    { id: 'custom-clips', ord: '08', icon: Sparkles, label: 'Custom Clips', short: 'custom clips' },
+    { id: 'settings', ord: '09', icon: Settings, label: 'Settings', short: 'settings' },
   ];
   const activeNav = navItems.find((n) => n.id === activeTab);
 
@@ -1551,6 +1553,9 @@ function App() {
 
         {/* Main Workspace */}
         <div className="flex-1 overflow-hidden relative">
+
+          {/* View: Custom Clips — separate analyze/review/approve/render workflow */}
+          {activeTab === 'custom-clips' && <CustomClips />}
 
           {/* View: Settings */}
           {activeTab === 'settings' && (
