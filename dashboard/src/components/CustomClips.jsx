@@ -4,7 +4,7 @@ import { apiFetch, apiJson } from '../lib/api';
 import { getApiUrl } from '../config';
 
 async function sendForm(path, form) {
-  const response = await apiFetch(path, { method: 'POST', body: form });
+  const response = await apiFetch(path, { method: 'POST', body: form, headers: geminiHeaders() });
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
     const detail = typeof payload.detail === 'string' ? payload.detail : `Request failed (${response.status})`;
@@ -14,6 +14,13 @@ async function sendForm(path, form) {
 }
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Self-host BYOK: analyze, chat and approve resolve the AI key from this header.
+// Settings persists it under the `gemini_key` localStorage entry (see App.jsx).
+const geminiHeaders = () => {
+  const key = localStorage.getItem('gemini_key');
+  return key ? { 'X-Gemini-Key': key } : {};
+};
 
 export default function CustomClips() {
   const [sourceFile, setSourceFile] = useState(null);
@@ -130,6 +137,11 @@ export default function CustomClips() {
   const startAnalysis = async (event) => {
     event.preventDefault();
     setError('');
+    if (aiProvider === 'gemini' && !localStorage.getItem('gemini_key')) {
+      setError('Add your Gemini API key in Settings first — the analyze request needs it.');
+      setStatusText('');
+      return;
+    }
     setStatusText('Preparing campaign analysis…');
     setRenderedClips([]);
     try {
@@ -247,7 +259,7 @@ export default function CustomClips() {
     try {
       const result = await apiJson(`/api/custom/drafts/${encodeURIComponent(draft.id)}/chat`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...geminiHeaders() },
         body: JSON.stringify({ revision: draft.revision, message: chatMessage.trim() }),
       });
       setDraft(result.draft);
@@ -271,7 +283,7 @@ export default function CustomClips() {
     try {
       const result = await apiJson(`/api/custom/drafts/${encodeURIComponent(draft.id)}/approve`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...geminiHeaders() },
         body: JSON.stringify({ revision: draft.revision, selected_clip_ids: selected }),
       });
       setDraft((current) => current ? { ...current, status: 'approved', render_job_id: result.job_id } : current);
