@@ -13,6 +13,7 @@ import hmac
 import time
 import zipfile
 import math
+import mimetypes
 import itertools
 import functools
 import asyncio
@@ -3455,6 +3456,55 @@ def _custom_source_path(draft_id: str, directory: str, draft: dict) -> str:
     if source_name and candidate.startswith(root) and os.path.isfile(candidate):
         return candidate
     return ""
+
+
+@app.get("/api/custom/drafts/{draft_id}/source-url")
+async def custom_draft_source_url(draft_id: str, request: Request):
+    """Return a player URL after checking the draft owner."""
+    try:
+        canonical_id = str(uuid.UUID(draft_id))
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Not found") from None
+    directory = await _assert_custom_draft_owner(request, canonical_id)
+    _, draft = _read_custom_draft(canonical_id)
+    source_path = _custom_source_path(canonical_id, directory, draft)
+    if not source_path or not os.path.isfile(source_path):
+        raise HTTPException(status_code=410, detail="Source video expired; analyze it again to preview.")
+    source_url = f"/api/custom/drafts/{canonical_id}/source"
+    if BILLING_ENABLED:
+        exp = int(time.time()) + SOURCE_URL_TTL_SECONDS
+        source_url += f"?exp={exp}&sig={_source_signature(canonical_id, exp)}"
+    return {"url": source_url}
+
+
+@app.get("/api/custom/drafts/{draft_id}/source")
+async def custom_draft_source(
+    draft_id: str, request: Request, exp: int = 0, sig: str = ""
+):
+    """Stream the private source for video preview; enforce owner or signed URL."""
+    try:
+        canonical_id = str(uuid.UUID(draft_id))
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Not found") from None
+    signed = (
+        BILLING_ENABLED
+        and bool(sig)
+        and exp > time.time()
+        and hmac.compare_digest(sig, _source_signature(canonical_id, exp))
+    )
+    if not signed:
+        directory = await _assert_custom_draft_owner(request, canonical_id)
+    else:
+        directory = _custom_draft_dir(canonical_id)
+    _, draft = _read_custom_draft(canonical_id)
+    source_path = _custom_source_path(canonical_id, directory, draft)
+    if not source_path or not os.path.isfile(source_path):
+        raise HTTPException(status_code=410, detail="Source video expired; analyze it again to preview.")
+    return FileResponse(
+        source_path,
+        media_type=mimetypes.guess_type(source_path)[0] or "video/mp4",
+        headers={"Cache-Control": "private, no-store"},
+    )
 
 
 @app.get("/api/custom/drafts/{draft_id}")

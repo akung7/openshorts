@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { AlertCircle, CheckCircle2, Clapperboard, FileText, Loader2, MessageCircle, Play, Plus, Save, Trash2, UploadCloud } from 'lucide-react';
 import { apiFetch, apiJson } from '../lib/api';
 import { getApiUrl } from '../config';
@@ -35,6 +35,11 @@ export default function CustomClips() {
   const [statusText, setStatusText] = useState('');
   const [error, setError] = useState('');
   const [renderedClips, setRenderedClips] = useState([]);
+  const [sourcePreviewUrl, setSourcePreviewUrl] = useState('');
+  const [sourcePreviewError, setSourcePreviewError] = useState('');
+  const [currentTime, setCurrentTime] = useState(0);
+  const [previewRange, setPreviewRange] = useState(null);
+  const sourceVideoRef = useRef(null);
 
   const isBusy = Boolean(activeJob);
   const eligibleGuideline = useMemo(() => {
@@ -58,6 +63,25 @@ export default function CustomClips() {
     }).catch(() => {});
     return () => { cancelled = true; };
   }, []);
+
+  useEffect(() => {
+    if (!draft?.id) {
+      setSourcePreviewUrl('');
+      setSourcePreviewError('');
+      setCurrentTime(0);
+      setPreviewRange(null);
+      return undefined;
+    }
+    let cancelled = false;
+    apiJson(`/api/custom/drafts/${encodeURIComponent(draft.id)}/source-url`)
+      .then(({ url }) => {
+        if (!cancelled) setSourcePreviewUrl(getApiUrl(url));
+      })
+      .catch((previewError) => {
+        if (!cancelled) setError(previewError?.detail || previewError?.message || 'Could not load the source video preview.');
+      });
+    return () => { cancelled = true; };
+  }, [draft?.id]);
 
   useEffect(() => {
     if (!activeJob) return undefined;
@@ -157,6 +181,37 @@ export default function CustomClips() {
     } : current);
     setSelected((current) => current.filter((id) => id !== key));
     setHasUnsavedEdits(true);
+  };
+
+  const previewCandidate = async (clip) => {
+    const player = sourceVideoRef.current;
+    if (!player || !sourcePreviewUrl || Number(clip.end) <= Number(clip.start)) return;
+    player.currentTime = Number(clip.start);
+    setPreviewRange({ id: clip.id || clip.clientKey, end: Number(clip.end) });
+    try {
+      await player.play();
+    } catch (_) {
+      setPreviewRange(null);
+      setError('The browser could not play this source video. Check the format or codec.');
+    }
+  };
+
+  const handlePreviewTimeUpdate = () => {
+    const player = sourceVideoRef.current;
+    if (!player) return;
+    setCurrentTime(player.currentTime);
+    if (previewRange && player.currentTime >= previewRange.end) {
+      player.pause();
+      setPreviewRange(null);
+    }
+  };
+
+  const setCandidateBoundaryFromPlayhead = (clip, field) => {
+    const key = clip.id || clip.clientKey;
+    const time = Math.round(currentTime * 10) / 10;
+    const start = field === 'start' ? time : Number(clip.start);
+    const end = field === 'end' ? time : Number(clip.end);
+    updateCandidate(key, { [field]: time, duration: Math.max(0, end - start) });
   };
 
   const saveCandidateEdits = async () => {
@@ -318,6 +373,20 @@ export default function CustomClips() {
             {draft.campaign_rules?.length > 0 && <div className="grid sm:grid-cols-2 gap-2 mt-4">{draft.campaign_rules.map((rule) => <div key={rule.id} className="p-3 rounded-input bg-paper2 border border-rule text-xs"><div className="flex items-center gap-2 text-ink font-medium"><CheckCircle2 size={14} className={rule.status === 'pass' ? 'text-ok' : 'text-warn'} />{rule.label}<span className="ml-auto text-muted uppercase">{rule.status}</span></div><p className="text-muted mt-1">{rule.reason}</p>{rule.evidence && <p className="text-ink2 mt-1">Evidence: {rule.evidence}</p>}</div>)}</div>}
           </div>
 
+          <div className="card p-4 sm:p-5 grid md:grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)] gap-4 items-center">
+            <div className="flex justify-center bg-black/30 rounded-input overflow-hidden min-h-40">
+              {sourcePreviewUrl
+                ? <video ref={sourceVideoRef} src={sourcePreviewUrl} controls preload="metadata" onTimeUpdate={handlePreviewTimeUpdate} onPause={() => setPreviewRange(null)} onError={() => setError('Could not load the source preview. The upload may have expired or use an unsupported format.')} className="w-full max-h-[28rem] object-contain" />
+                : <p className="self-center text-xs text-muted p-4">Loading source preview…</p>}
+            </div>
+            <div>
+              <p className="eyebrow">SOURCE PREVIEW</p>
+              <h3 className="text-base text-ink font-medium mt-1">Check the exact moment before rendering</h3>
+              <p className="text-sm text-muted mt-2">Player position: <span className="text-ink tabular-nums">{currentTime.toFixed(1)}s</span>. Use candidate controls to preview its range or set a boundary from the playhead.</p>
+              <p className="text-xs text-muted mt-2">Playback uses the original uploaded/downloaded source. No render starts from preview.</p>
+            </div>
+          </div>
+
           {draft.status === 'draft' && <div className="flex flex-wrap items-center justify-between gap-3 card p-4">
             <div><h3 className="text-sm font-medium text-ink">Edit clip plan</h3><p className="text-xs text-muted mt-1">Adjust timeline, title, hook and caption. Timing edits may change compliance checks.</p></div>
             <div className="flex gap-2">
@@ -347,6 +416,13 @@ export default function CustomClips() {
                     <label className="block text-xs text-muted">Title<input aria-label={`Candidate ${index + 1} title`} value={clip.title} disabled={!editable || isBusy || savingEdits} onChange={(e) => updateCandidate(key, { title: e.target.value })} maxLength={160} className="input mt-1 w-full" /></label>
                     <label className="block text-xs text-muted">Hook<input aria-label={`Candidate ${index + 1} hook`} value={clip.hook} disabled={!editable || isBusy || savingEdits} onChange={(e) => updateCandidate(key, { hook: e.target.value })} maxLength={300} className="input mt-1 w-full" /></label>
                     <label className="block text-xs text-muted">Caption<textarea aria-label={`Candidate ${index + 1} caption`} value={clip.caption} disabled={!editable || isBusy || savingEdits} onChange={(e) => updateCandidate(key, { caption: e.target.value })} maxLength={2000} rows={3} className="input mt-1 w-full resize-y" /></label>
+                    <div className="flex flex-wrap gap-2">
+                      <button type="button" onClick={() => previewCandidate(clip)} disabled={!sourcePreviewUrl || isBusy || Number(clip.end) <= Number(clip.start)} className="btn-quiet px-2.5 py-1.5 text-xs disabled:opacity-50"><Play size={13} />Preview range</button>
+                      {editable && <>
+                        <button type="button" onClick={() => setCandidateBoundaryFromPlayhead(clip, 'start')} disabled={!sourcePreviewUrl || isBusy || savingEdits} className="btn-quiet px-2.5 py-1.5 text-xs disabled:opacity-50">Set start · {currentTime.toFixed(1)}s</button>
+                        <button type="button" onClick={() => setCandidateBoundaryFromPlayhead(clip, 'end')} disabled={!sourcePreviewUrl || isBusy || savingEdits} className="btn-quiet px-2.5 py-1.5 text-xs disabled:opacity-50">Set end · {currentTime.toFixed(1)}s</button>
+                      </>}
+                    </div>
                     {clip.evidence && <blockquote className="text-xs text-ink2 border-l-2 border-rule pl-3">Source: {clip.evidence}</blockquote>}
                     {clip.checks?.length > 0 && <ul className="space-y-1">{clip.checks.map((check, checkIndex) => <li key={`${check.rule_id}-${checkIndex}`} className="text-xs text-muted flex gap-2"><span className={check.status === 'pass' ? 'text-ok' : 'text-warn'}>{check.status}</span><span>{check.reason}{check.evidence ? ` — ${check.evidence}` : ''}</span></li>)}</ul>}
                   </div>
