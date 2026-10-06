@@ -31,6 +31,8 @@ export default function CustomClips() {
   const [guideText, setGuideText] = useState('');
   const [campaignAiModels, setCampaignAiModels] = useState([{ id: 'gemini', provider: 'Gemini', model: 'gemini-3.1-flash-lite' }]);
   const [aiProvider, setAiProvider] = useState('gemini');
+  const [campaigns, setCampaigns] = useState([]);
+  const [campaignId, setCampaignId] = useState('');
   const [rightsAcknowledged, setRightsAcknowledged] = useState(false);
   const [draft, setDraft] = useState(null);
   const [selected, setSelected] = useState([]);
@@ -50,10 +52,11 @@ export default function CustomClips() {
 
   const isBusy = Boolean(activeJob);
   const eligibleGuideline = useMemo(() => {
+    if (campaignId) return true; // the campaign supplies its saved guideline
     if (guideMode === 'file') return Boolean(guideFile);
     if (guideMode === 'url') return Boolean(guideUrl.trim());
     return Boolean(guideText.trim());
-  }, [guideFile, guideMode, guideText, guideUrl]);
+  }, [campaignId, guideFile, guideMode, guideText, guideUrl]);
 
   useEffect(() => {
     let cancelled = false;
@@ -68,6 +71,40 @@ export default function CustomClips() {
         : models[0].id;
       setAiProvider(defaultProvider);
     }).catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    apiJson('/api/campaigns').then((data) => {
+      if (cancelled) return;
+      const list = data.campaigns || [];
+      setCampaigns(list);
+      let preselect = '';
+      try { preselect = localStorage.getItem('custom_clips_campaign') || ''; } catch (_) { /* private mode */ }
+      if (preselect && list.some((campaign) => campaign.id === preselect)) setCampaignId(preselect);
+      try { localStorage.removeItem('custom_clips_campaign'); } catch (_) { /* noop */ }
+    }).catch(() => { /* campaigns are optional for analysis */ });
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    let resumeId = '';
+    try {
+      resumeId = localStorage.getItem('custom_clips_resume') || '';
+      localStorage.removeItem('custom_clips_resume');
+    } catch (_) { /* private mode */ }
+    if (!resumeId) return undefined;
+    let cancelled = false;
+    apiJson(`/api/custom/drafts/${encodeURIComponent(resumeId)}`)
+      .then((resumed) => {
+        if (cancelled || !resumed?.id) return;
+        setDraft(resumed);
+        setSelected([]);
+        setHasUnsavedEdits(false);
+        setStatusText('Resumed the draft from your campaign.');
+      })
+      .catch(() => { /* the draft may have expired; the form stays usable */ });
     return () => { cancelled = true; };
   }, []);
 
@@ -153,6 +190,7 @@ export default function CustomClips() {
       if (guideMode === 'text') form.append('guideline_text', guideText);
       form.append('acknowledged', rightsAcknowledged ? '1' : '0');
       form.append('ai_provider', aiProvider);
+      if (campaignId) form.append('campaign_id', campaignId);
       const job = await sendForm('/api/custom/analyze', form);
       setDraft(null);
       setSelected([]);
@@ -349,6 +387,19 @@ export default function CustomClips() {
             {guideMode === 'url' && <input type="url" value={guideUrl} onChange={(e) => setGuideUrl(e.target.value)} placeholder="https://public-site.example/guideline.pdf" className="input w-full" />}
             <p className="text-xs text-muted mt-2">Guidelines are used for this draft only. PDF, plain text, Markdown, or readable public pages are supported.</p>
           </section>
+
+          {campaigns.length > 0 && (
+            <section>
+              <label htmlFor="analyze-campaign" className="block text-sm font-medium text-ink mb-2">Campaign (optional)</label>
+              <select id="analyze-campaign" value={campaignId} onChange={(e) => setCampaignId(e.target.value)} className="input w-full sm:max-w-md">
+                <option value="">No campaign — one-off analysis</option>
+                {campaigns.map((campaign) => (
+                  <option key={campaign.id} value={campaign.id}>{campaign.name}{campaign.platform ? ` · ${campaign.platform}` : ''}</option>
+                ))}
+              </select>
+              <p className="text-xs text-muted mt-2">A selected campaign supplies its saved guideline and mandatory rules automatically; anything you paste or upload below is added on top.</p>
+            </section>
+          )}
 
           <section>
             <label htmlFor="campaign-ai-provider" className="block text-sm font-medium text-ink mb-2">AI model for this campaign</label>
